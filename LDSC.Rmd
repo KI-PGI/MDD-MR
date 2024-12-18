@@ -341,7 +341,8 @@ write_xlsx(merged, "trait_selection/TraitSelection.xlsx")
 
 ## Forest plot
 
-Because of the large number of traits I think we should present a single row heatmap for each of the trait categories. 
+Because of the large number of traits I think we create a single row heatmap for each of the trait categories. 
+
 ```{r category heatmap, eval = F}
 
 gatheredresults <- fread("results/ldsc/rg_results.tsv")
