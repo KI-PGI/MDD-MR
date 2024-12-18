@@ -92,7 +92,6 @@ echo "5e-8 0 5e-8" > =range_list
 
 echo -en '#!/bin/bash
 #SBATCH --job-name=plink_score
-#SBATCH -A sens2017519
 #SBATCH -t 1:00:00
 #SBATCH --array=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
 
@@ -581,49 +580,6 @@ kable(results_classic_df)
 
 ```
 
-# Step 3b. Repeating on sub-set with time-to-event data
-
-As per reviewer suggestions, I now repeat the 2SLS analysis for the diseases, for which we have date at diagnosis, focusing on the subset of individuals for whom MDD diagnosis preceded the disease.
-
-```{r}
-
-# Adapt function to limit dataset to individuals where MDD preceded trait
-
-tsls <- function(trait) {
-  
-  f1 <- glue("{trait} ~ MDD  | 
-             mdd_prs_pc")
-  
-  x <- fread(paste0("subset_", trait, ".tsv")) %>% 
-    left_join(pheno, by = c("eid" = "IID"))
-  
-  x <- x %>% filter(!is.na(.[[trait]]) & !is.na(mdd_prs_pc))
-  
-  if (nrow(x) > 100) {
-    res <- (summary(ivreg(f1, data=x)))$coefficients
-    res1 <- (summary(ivreg(f1, data=x)))
-    res2 <- data.frame(res, outcome = trait, df = res1$df[2]) 
-    res2 %>% filter(row.names(res2) == "MDD")
-  }
-}
-
-# Run for selected traits
-
-traits <- c("anemia", "celiac", "sinusitis", "cushing", "accidents", "alcdeath", "cannabisabuse", "selfharm")
-
-results_classic <- map(traits, tsls)
-results_classic_df <- rbindlist(results_classic)
-
-colnames(results_classic_df) <- c("beta", "se", "t", "p", "outcome", "df")
-
-fwrite(results_classic_df, "2slsl_results_classic_subset.tsv")
-
-kable(results_classic_df)
-
-```
-
-
-
 # Step 4. Sensitivity analyses
 
 Deriving R2 per outcome. This is the explained variance by the intrument in each outcome:
@@ -692,6 +648,7 @@ kable(results_r2_df)
 ```
 
 This is the variance explained by the PRS created with LDpred2:
+
 ``` {R R2 ldpred}
 
 # Function to get the OLS R2 for the ldpred2 PRS
