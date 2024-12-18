@@ -1,0 +1,1207 @@
+---
+title: "One sample MR in UKB"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    collapsed: true
+    theme: united
+---
+
+
+```{r setup, include=FALSE, eval=TRUE}
+
+library(tidyverse)
+library(data.table)
+library(knitr)
+library(fmsb)
+library(pals)
+library(glue)
+library(ivreg)
+library(OneSampleMR)
+library(TwoSampleMR)
+
+
+knitr::opts_knit$set(root.dir = "")
+                       
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, error=FALSE)
+
+```
+
+# Step 1. Instruments (PRS)
+
+We need to derive genetic instruments on an individual level (=PRS). For this we use Als et al. 2023 MDD sumstats leaving out UKB. LDPred2 code is recycled from other projects and relies on the installation of Comorment singularity containers, https://github.com/comorment/containers. 
+
+``` {bash PRS, eval=F}
+
+cd $COMORMENT/OneSampleMR
+
+# NOTE: by default, the containerised LDPred version takes 0.2 as the prior for the portion of causal SNPs
+
+echo -en '#!/bin/bash
+#SBATCH --job-name=ldpredmdd
+#SBATCH -p node
+#SBATCH -t 20:00:00
+
+# point to input/output files
+export fileGeno=ukb_imp_v3_maf_0.01_hm3.bed
+export fileGenoRDS=ukb_geno.rds
+export fileSumstats=OneSampleMR/MDD_Als_looUKB_tidy.tsv.gz
+export fileOut=OneSampleMR/MDD_looUKB
+
+# set environmental variables. Replace "<path/to/comorment>" with 
+# the full path to the folder containing cloned "containers" and "ldpred2_ref" repositories
+export COMORMENT=.. # path to installed containers
+export SIF=$COMORMENT/containers/singularity
+export REFERENCE=$COMORMENT/containers/reference
+export LDPRED2_REF=$COMORMENT/ldpred2_ref
+export SINGULARITY_BIND=$REFERENCE:/REF,${LDPRED2_REF}:/ldpred2_ref
+export RSCRIPT="singularity exec --home=$PWD:/home $SIF/r.sif Rscript"
+
+# Generate PGS using LDPRED2-auto
+$RSCRIPT $COMORMENT/containers/usecases/LDpred2/ldpred2.R \
+ --ldpred-mode auto \
+ --merge-by-rsid \
+ --col-stat B --col-stat-se SE \
+ --geno-file $fileGenoRDS --sumstats $fileSumstats --out $fileOut.auto
+ 
+' > OneSampleMR/mdd_ldpred2.sh
+
+# Now with classical approach for comparison
+# Using the same SNP set as for TSMR (from MDD_exp_dat)
+
+cd OneSampleMR
+
+singularity shell --home $PWD $SIF/r.sif
+R
+library(data.table)
+library(tidyverse)
+
+topsnps <- fread("MDD_exp_dat.tsv") %>% select(SNP)
+fwrite(topsnps, "MDD.topsnps", sep = "\t", quote = F, na = NA, col.names = F)
+
+pvalues <- fread("MDD_Als_looUKB_tidy.tsv.gz") %>% select(SNP, P)
+fwrite(pvalues, "MDD_looUKB_SNP.pvalue", sep = "\t", quote = F, na = NA)
+
+q()
+exit
+
+
+echo "5e-8 0 5e-8" > =range_list
+
+echo -en '#!/bin/bash
+#SBATCH --job-name=plink_score
+#SBATCH -A sens2017519
+#SBATCH -t 1:00:00
+#SBATCH --array=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+
+for SLURM_ARRAY_TASK_ID in  1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22;
+do 
+$PLINK \
+    --bfile /proj/sens2017519/nobackup/b2016326_nobackup/private/arvhar/PLINK_BINARY/ukb_imp_chr${SLURM_ARRAY_TASK_ID}_v3_maf_0.01 \
+    --score OneSampleMR/MDD_looUKB.tab 1 5 7 header no-sum \
+    --q-score-range OneSampleMR/range_list OneSampleMR/MDD_looUKB_SNP.pvalue \
+    --extract OneSampleMR/MDD.topsnps \
+    --out OneSampleMR/MDD_looUKB_chr${SLURM_ARRAY_TASK_ID};
+done 
+' > OneSampleMR/plink_prs.sh
+
+
+singularity shell --home $PWD $SIF/r.sif
+R
+library(data.table)
+library(tidyverse)
+
+renamescores <- function(file) {
+
+  x <- fread(file)
+
+  newname <- gsub("MDD_looUKB_", "", file)
+  newname <- gsub(".5e-8.profile", "", newname)
+
+  x <- x %>%
+    rename({{newname}} := SCORE) %>% 
+    select(IID, {{newname}})
+  x
+
+}
+
+files <- list.files(pattern = ".5e-8.profile")
+scorelist <- map(files, renamescores)
+scores <- Reduce(merge, scorelist)
+
+scores <- scores %>% 
+  mutate(mdd_prs_pc = rowSums(across(c(chr1:chr22)))) %>% 
+  select(IID, mdd_prs_pc)
+  
+fwrite(scores, "MDD_looUKB.5e-8.profile")
+q()
+exit
+  
+
+```
+
+# Step 2. Extract outcomes
+
+Outcomes are extracted from the UK Biobank data. I create a set of outcomes that have previously been associated with MDD.  
+
+``` {r MR2 outcomes, eval=F}
+
+# Move to VDI/ Vector to extract data
+
+R-4.0.5
+library(vectorTools)
+library(purrr) 
+library(tidyverse)
+library(data.table)
+library(datawizard)
+
+
+# Use ub_extract from vectorTools to get the covariates and all ICD data
+covar <- ukb_extract(c("f.34\\.", "f.31\\."))
+
+icd_data <- ukb_extract("f.41270", ukb_data=T)
+
+# Define and extract the ICD codes of interest
+codes <- list(
+  MDD = c("F32", "F33"),
+  herpes = "B00",
+  varicella = "B01",
+  cushing = "E24",
+  alcdeath = c("E244","F10","G312","G621","G721","I426","K292","K70","K852","K860","Q860","R780","X45","X65","Y15"),
+  cannabisabuse = "F12",
+  stroke = "I63",
+  tinnitus = "H931",
+  sinusitis = "J32",
+  celiac = "K900",
+  psoriasis = "L40",
+  accidents = c("V", "W", "X0", "X1", "X2", "X3", "X4", "X51", "X52", "X53", "X54", "X55", "X56"),
+  selfharm = c("X6", "X7", "X81", "X82", "X83", "X84", "E95")
+)
+
+icd <- map2_df(codes, names(codes), check_for_code, data = icd_data)
+
+# For ICD we consider all missing as non-cases
+icd <- icd %>% 
+  mutate_all(~replace_na(.,0))
+
+fwrite(icd, "ukb_mr_outcomes_icd.tsv")
+
+
+# Non-ICD traits
+
+workhours <- ukb_extract("f.767\\.")
+educationage <- ukb_extract("f.845\\.")
+oilyfish <- ukb_extract("f.1329\\.")
+puberty <- ukb_extract("f.2385\\.")
+offspringbirthweight <- ukb_extract("f.2744\\.")
+contrapill <- ukb_extract("f.2784\\.")
+nightshifts <- ukb_extract("f.3426\\.")
+stillbirths <- ukb_extract("f.3829\\.")
+pregnancytermin <- ukb_extract("f.3849\\.")
+healthsatis <- ukb_extract("f.4548\\.")
+dropout <- ukb_extract("f.6138\\.")
+employment <- ukb_extract("f.6142\\.")
+sicknessleave <- ukb_extract("f.6142\\.")
+bereavement <- ukb_extract("f.6145\\.")
+divorce <- ukb_extract("f.6145\\.")
+suicattempt <- ukb_extract("f.20483\\.") 
+physabuse <- ukb_extract("f.20488.")
+sexabuse <- ukb_extract("f.20490.")
+familyrel <- ukb_extract("f.20522\\.") 
+partnerabuse <- ukb_extract("f.20523\\.")  
+accidents_sr <- ukb_extract("f.20526\\.") 
+combat <- ukb_extract("f.20527\\.") 
+deprivation <- ukb_extract("f.189\\.")
+calcium <- ukb_extract("f.100024\\.")
+iron <- ukb_extract("f.100011\\.")
+magnesium <- ukb_extract("f.100017\\.")
+oestradiol <- ukb_extract("f.30800\\.")
+hospitalizations <- ukb_extract("f.41235\\.")
+fish <- ukb_extract("f.103140\\.")
+fruit <- ukb_extract("f.104400\\.")
+mobility <- ukb_extract("f.120098\\.")
+selfcare <- ukb_extract("f.120099\\.")
+dailyactiv <- ukb_extract("f.120100\\.")
+pain <- ukb_extract("f.120101\\.")
+subhealth <- ukb_extract("f.120103\\.")
+
+
+```
+
+
+
+Still working on Vector, I clean and merge the data.
+
+``` {r Clean data, eval=F}
+
+workhours <- workhours %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(workhours = f.767.0.0) %>% 
+  select(f.eid, workhours) %>% 
+  mutate(workhours = ifelse(workhours == 0, NA, workhours)) %>% 
+  ungroup()
+workhours$workhours <- winsorize(workhours$workhours, method="zscore", threshold=4, robust = T) 
+
+educationage <- educationage %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(educationage = f.845.0.0) %>% 
+  select(f.eid, educationage) %>% 
+  mutate(educationage = ifelse(educationage < 10 | educationage > 99, NA, educationage)) 
+educationage$educationage <- winsorize(educationage$educationage, method="zscore", threshold=4, robust = T) 
+
+oilyfish <- oilyfish %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(oilyfish = f.1329.0.0) %>% 
+  select(f.eid, oilyfish) 
+
+puberty <- puberty %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(puberty = f.2385.0.0) %>% 
+  select(f.eid, puberty) 
+
+offspringbirthweight <- offspringbirthweight %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(offspringbirthweight = f.2744.0.0) %>% 
+  select(f.eid, offspringbirthweight) %>% 
+  mutate(offspringbirthweight = ifelse(offspringbirthweight == 0, NA, offspringbirthweight)) 
+
+contrapill <- contrapill %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(contrapill = f.2784.0.0) %>% 
+  select(f.eid, contrapill) 
+
+nightshifts <- nightshifts %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(nightshifts = f.3426.0.0) %>% 
+  select(f.eid, nightshifts) 
+
+stillbirths <- stillbirths %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(stillbirths = f.3829.0.0) %>% 
+  select(f.eid, stillbirths) 
+
+pregnancytermin <- pregnancytermin %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(pregnancytermin = f.3849.0.0) %>% 
+  select(f.eid, pregnancytermin) %>% 
+  mutate(pregnancytermin = ifelse(pregnancytermin > 0, 1, 0)) 
+
+healthsatis <- healthsatis %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(healthsatis = f.4548.0.0) %>% 
+  select(f.eid, healthsatis)
+
+dropout <- dropout %>% 
+  rowwise() %>% 
+  mutate(dropout = ifelse(max(c_across(f.6138.0.0:f.6138.3.5), na.rm = T) == -7, 1, 0)) %>% 
+  select(f.eid, dropout) %>% 
+  ungroup() %>% 
+  mutate(dropout = ifelse(is.infinite(dropout), NA, dropout))
+
+employment <- employment %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(employment = as.integer(if_any(f.6142.0.0:f.6142.0.6, ~ !is.na(.) & . == 1))) %>% 
+  mutate(employment = ifelse(if_all(f.6142.0.0:f.6142.0.6, ~ is.na(.)), NA, employment)) %>% 
+  select(f.eid, employment)
+  
+sicknessleave <- sicknessleave %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(sicknessleave = as.integer(if_any(f.6142.0.0:f.6142.0.6, ~ !is.na(.) & . == 4))) %>% 
+  mutate(sicknessleave = ifelse(if_all(f.6142.0.0:f.6142.0.6, ~ is.na(.)), NA, sicknessleave)) %>% 
+  select(f.eid, sicknessleave)
+
+bereavement <- bereavement %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(bereavement = as.integer(if_any(f.6145.0.0:f.6145.3.5, ~ !is.na(.) & . == 3) | if_any(f.6145.0.0:f.6145.3.5, ~ !is.na(.) & . == 4))) %>% 
+  mutate(bereavement = ifelse(if_all(f.6145.0.0:f.6145.3.5, ~ is.na(.)), NA, bereavement)) %>% 
+  select(f.eid, bereavement)
+
+divorce <- divorce %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(divorce = as.integer(if_any(f.6145.0.0:f.6145.3.5, ~ !is.na(.) & . == 5))) %>% 
+  mutate(divorce = ifelse(if_all(f.6145.0.0:f.6145.3.5, ~ is.na(.)), NA, divorce)) %>% 
+  select(f.eid, divorce)
+
+suicattempt <- suicattempt %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(suicattempt = f.20483.0.0.x) %>% 
+  select(f.eid, suicattempt)
+
+physabuse <- physabuse %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(physabuse = f.20488.0.0.x) %>% 
+  select(f.eid, physabuse)
+
+sexabuse <- sexabuse %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(sexabuse = f.20490.0.0.x) %>% 
+  select(f.eid, sexabuse)
+
+familyrel <- familyrel %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(familyrel = f.20522.0.0.x) %>% 
+  select(f.eid, familyrel)
+
+partnerabuse <- partnerabuse %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(partnerabuse = f.20523.0.0.x) %>% 
+  select(f.eid, partnerabuse)
+
+accidents_sr <- accidents_sr %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(accidents_sr = f.20526.0.0.x) %>% 
+  mutate(accidents_sr = ifelse(accidents_sr > 0, 1, 0)) %>% 
+  select(f.eid, accidents_sr)
+
+combat <- combat %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(combat = f.20527.0.0.x) %>% 
+  mutate(combat = ifelse(combat > 0, 1, 0)) %>% 
+  select(f.eid, combat)
+
+deprivation <- deprivation %>% 
+  mutate(deprivation = f.189.0.0) %>% 
+  select(f.eid, deprivation)
+
+calcium <- calcium %>% 
+  mutate(calcium = f.100024.0.0.x) %>% 
+  select(f.eid, calcium) 
+
+iron <- iron %>% 
+  mutate(iron = f.100011.0.0.x) %>% 
+  select(f.eid, iron)
+
+magnesium <- magnesium %>% 
+  mutate(magnesium = f.100017.0.0.x) %>% 
+  select(f.eid, magnesium) 
+
+oestradiol <- oestradiol %>% 
+  mutate(oestradiol = f.30800.0.0) %>% 
+  select(f.eid, oestradiol) 
+
+hospitalizations <- hospitalizations %>% 
+  mutate(hospitalizations = f.41235.0.0) %>% 
+  select(f.eid, hospitalizations)
+hospitalizations$hospitalizations <- winsorize(hospitalizations$hospitalizations, method="zscore", threshold=4, robust = T) 
+
+fish <- fish %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(fish = f.103140.0.0.x) %>% 
+  select(f.eid, fish) 
+        
+fruit <- fruit %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(fruit = f.104400.0.0.x) %>% 
+  select(f.eid, fruit) 
+
+mobility <- mobility %>% 
+  mutate(mobility = recode(f.120098.0.0, `-521`=0, `-522`=1, `-523`=2, `-524`=3, `-525`=4)) %>% 
+  select(f.eid, mobility)
+
+selfcare <- selfcare %>% 
+  mutate(selfcare = recode(f.120099.0.0, `-521`=0, `-522`=1, `-523`=2, `-524`=3, `-525`=4)) %>% 
+  select(f.eid, selfcare)
+
+dailyactiv <- dailyactiv %>% 
+  mutate(dailyactiv = recode(f.120100.0.0, `-521`=0, `-522`=1, `-523`=2, `-524`=3, `-525`=4)) %>% 
+  select(f.eid, dailyactiv)
+
+pain <- pain %>% 
+  mutate(pain = recode(f.120101.0.0, `-521`=0, `-522`=1, `-523`=2, `-524`=3, `-525`=4)) %>% 
+  select(f.eid, pain)
+
+subhealth <- subhealth %>% 
+  mutate_all(~ifelse(.x < 0, NA, .x)) %>% 
+  mutate(subhealth = f.120103.0.0) %>% 
+  select(f.eid, subhealth)
+subhealth$subhealth <- winsorize(subhealth$subhealth, method="zscore", threshold=4, robust = T) 
+
+cleanpheno <- workhours %>% 
+  full_join(educationage) %>% 
+  full_join(oilyfish) %>% 
+  full_join(puberty) %>% 
+  full_join(offspringbirthweight) %>% 
+  full_join(contrapill) %>% 
+  full_join(nightshifts) %>% 
+  full_join(stillbirths) %>% 
+  full_join(pregnancytermin) %>% 
+  full_join(healthsatis) %>% 
+  full_join(dropout) %>% 
+  full_join(employment) %>% 
+  full_join(sicknessleave) %>% 
+  full_join(bereavement) %>% 
+  full_join(divorce) %>% 
+  full_join(suicattempt) %>% 
+  full_join(physabuse) %>% 
+  full_join(sexabuse) %>% 
+  full_join(familyrel) %>% 
+  full_join(partnerabuse) %>% 
+  full_join(accidents_sr) %>% 
+  full_join(combat) %>% 
+  full_join(deprivation) %>% 
+  full_join(calcium) %>% 
+  full_join(iron) %>% 
+  full_join(magnesium) %>% 
+  full_join(oestradiol) %>% 
+  full_join(hospitalizations) %>% 
+  full_join(fish) %>% 
+  full_join(fruit) %>% 
+  full_join(mobility) %>% 
+  full_join(selfcare) %>% 
+  full_join(dailyactiv) %>% 
+  full_join(pain) %>% 
+  full_join(subhealth) 
+
+fwrite(cleanpheno, "ukb_mr_outcomes_sr.tsv")
+
+
+```
+
+
+``` {r final dataframe, eval=F}
+# merge data
+
+mdd_mr2outcomes <- covar %>% 
+  inner_join(icd) %>% 
+  inner_join(cleanpheno)
+  
+fwrite(mdd_mr2outcomes, "ukb_mr2outcomes.tsv")
+
+```
+
+We now move the data to the working directory and start local analysis.
+
+# Step 3. 2-stage least squares
+
+``` {R dataframe for TSLS}
+
+mdd <- fread("MDD.auto") %>% 
+  rename(mdd_prs_ldpred = score) %>% 
+  select(IID, mdd_prs_ldpred)
+mdd2 <- fread("MDD_looUKB.5E-08.profile") %>% 
+  rename(mdd_prs_pc = SCORE) %>% 
+  select(IID, mdd_prs_pc)
+pc <- fread("UKB_eoMDD.covar") %>% 
+  select(!sex_1)
+
+# Merge the dataframes, recode birth year and infinite values
+pheno <- fread("ukb_mr2outcomes.tsv") %>% 
+  rename(IID = f.eid) %>% 
+  left_join(mdd) %>% 
+  left_join(mdd2) %>% 
+  left_join(pc) %>% 
+  rename(sex = f.31.0.0) %>% 
+  mutate(yob=ifelse(f.34.0.0>1900, f.34.0.0, NA)) %>% 
+  select(!f.34.0.0) %>% 
+  group_by(IID) %>% 
+  mutate_all(funs(max(.))) %>% 
+  slice(1) %>% 
+  ungroup()
+
+# Find binary 
+
+is_bin <- map_lgl(pheno, ~ length(unique(.)) <= 3)
+is_con <- colnames(pheno)[!is_bin]
+is_con <- is_con[-1]
+
+
+# Scale continuous and regress out birth year, sex and PCs from the PRS
+pheno <- pheno %>% 
+  mutate(across(all_of(is_con), ~ scale(.))) %>% 
+  mutate(mdd_prs_ldpred =
+           resid(lm(mdd_prs_ldpred ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10, 
+                    na.action = na.exclude))
+         ) %>% 
+  mutate(mdd_prs_pc =
+           resid(lm(mdd_prs_pc ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10, 
+                    na.action = na.exclude))
+         ) %>% 
+  select(!FID)
+
+fwrite(pheno, "ukb_mr2outcomes_clean.tsv")
+
+```
+
+
+```{r TSLS}
+
+pheno <- fread("ukb_mr2outcomes_clean.tsv")
+
+# Function for 2 stage ls
+
+tsls <- function(trait) {
+  
+  f1 <- glue("{trait} ~ MDD  | 
+             mdd_prs_ldpred")
+  
+  x <- pheno %>% filter(!is.na(.[[trait]]) & !is.na(mdd_prs_ldpred)) %>% filter(max(MDD)==1)
+  
+  if (nrow(x) > 100) {
+    res <- (summary(ivreg(f1, data=x)))$coefficients
+    res1 <- (summary(ivreg(f1, data=x)))
+    res2 <- data.frame(res, outcome = trait, df = res1$df[2]) 
+    res2 %>% filter(row.names(res2) == "MDD")
+  }
+} 
+
+tsls2 <- function(trait) {
+  
+  f2 <- glue("{trait} ~ MDD  | 
+             mdd_prs_pc")
+  
+  x <- pheno %>% filter(!is.na(.[[trait]]) & !is.na(mdd_prs_pc)) %>% filter(max(MDD)==1)
+  
+  if (nrow(x) > 100) {
+    res <- (summary(ivreg(f2, data=x)))$coefficients
+    res1 <- (summary(ivreg(f2, data=x)))
+    res2 <- data.frame(res, outcome = trait, df = res1$df[2]) 
+    res2 %>% filter(row.names(res2) == "MDD")
+  }
+} 
+
+
+
+traits <- colnames(pheno[,c(4:50,74)])
+
+results_ldpred <- map(traits, tsls)
+results_classic <- map(traits, tsls2)
+results_ldpred_df <- rbindlist(results_ldpred)
+results_classic_df <- rbindlist(results_classic)
+
+colnames(results_ldpred_df) <- c("beta", "se", "t", "p", "outcome", "df")
+colnames(results_classic_df) <- c("beta", "se", "t", "p", "outcome", "df")
+
+fwrite(results_ldpred_df, "2slsl_results_ldpred.tsv")
+fwrite(results_classic_df, "2slsl_results_classic.tsv")
+
+kable(results_ldpred_df)
+kable(results_classic_df)
+
+```
+
+# Step 3b. Repeating on sub-set with time-to-event data
+
+As per reviewer suggestions, I now repeat the 2SLS analysis for the diseases, for which we have date at diagnosis, focusing on the subset of individuals for whom MDD diagnosis preceded the disease.
+
+```{r}
+
+# Adapt function to limit dataset to individuals where MDD preceded trait
+
+tsls <- function(trait) {
+  
+  f1 <- glue("{trait} ~ MDD  | 
+             mdd_prs_pc")
+  
+  x <- fread(paste0("subset_", trait, ".tsv")) %>% 
+    left_join(pheno, by = c("eid" = "IID"))
+  
+  x <- x %>% filter(!is.na(.[[trait]]) & !is.na(mdd_prs_pc))
+  
+  if (nrow(x) > 100) {
+    res <- (summary(ivreg(f1, data=x)))$coefficients
+    res1 <- (summary(ivreg(f1, data=x)))
+    res2 <- data.frame(res, outcome = trait, df = res1$df[2]) 
+    res2 %>% filter(row.names(res2) == "MDD")
+  }
+}
+
+# Run for selected traits
+
+traits <- c("anemia", "celiac", "sinusitis", "cushing", "accidents", "alcdeath", "cannabisabuse", "selfharm")
+
+results_classic <- map(traits, tsls)
+results_classic_df <- rbindlist(results_classic)
+
+colnames(results_classic_df) <- c("beta", "se", "t", "p", "outcome", "df")
+
+fwrite(results_classic_df, "2slsl_results_classic_subset.tsv")
+
+kable(results_classic_df)
+
+```
+
+
+
+# Step 4. Sensitivity analyses
+
+Deriving R2 per outcome. This is the explained variance by the intrument in each outcome:
+
+``` {R R2}
+
+# Function to get the OLS R2 for the PRS (there's no 2sls R2)
+
+# binary 
+
+olsR2_bin <- function(trait) {
+  f1 <- glue("{trait} ~ mdd_prs_pc + sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10")
+  f2 <- as.formula(glue("{trait} ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10"))
+  res <- summary(x <- glm(data = pheno, f1, family = "binomial"))$coefficients
+  res_noprs <- summary(x_noprs <- glm(data = pheno, f2, family = "binomial"))$coefficients
+  R2 <- NagelkerkeR2(x)$R2 - NagelkerkeR2(x_noprs)$R2
+  R2_res <- data.frame(R2)
+  rownames(R2_res) <- {trait}
+  R2_res <- R2_res %>% rownames_to_column("trait")
+  R2_res
+} 
+
+traits_bin <- colnames(pheno %>% 
+  select(where(~ all(. %in% c(0:1, NA)))) %>% 
+  select(!c(sex, MDD)))
+
+results_r2_bin <- map(traits_bin, olsR2_bin)
+names(results_r2_bin) <- traits_bin
+results_r2_bin_df <- rbindlist(results_r2_bin)
+
+# MDD 
+
+results_r2_MDD <- map("MDD", olsR2_bin)
+
+# continous
+
+olsR2_con <- function(trait) {
+  f1 <- glue("{trait} ~ mdd_prs_pc + sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10")
+  f2 <- as.formula(glue("{trait} ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10"))
+  res <- summary(x <- lm(data = pheno, f1))$coefficients
+  res_noprs <- summary(x_noprs <- lm(data = pheno, f2))$coefficients
+  R2 <- summary(x)$r.squared - summary(x_noprs)$r.squared
+  R2_res <- data.frame(R2)
+  rownames(R2_res) <- {trait}
+  R2_res <- R2_res %>% rownames_to_column("trait")
+  R2_res
+} 
+
+traits_con<- colnames(pheno %>% 
+  select(where(~ !all(. %in% c(0:1, NA)))) %>% 
+    select(!c(IID, mdd_prs_ldpred:yob))
+  )
+
+
+results_r2_con <- map(traits_con, olsR2_con)
+names(results_r2_con) <- traits_con
+results_r2_con_df <- rbindlist(results_r2_con)
+
+results_r2_df <- bind_rows(results_r2_bin_df, results_r2_con_df)
+
+fwrite(results_r2_df, "prs_results_r2.tsv")
+
+kable(results_r2_df)
+
+
+```
+
+This is the variance explained by the PRS created with LDpred2:
+``` {R R2 ldpred}
+
+# Function to get the OLS R2 for the ldpred2 PRS
+
+# binary 
+
+olsR2_bin <- function(trait) {
+  f1 <- glue("{trait} ~ mdd_prs_ldpred + sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10")
+  f2 <- as.formula(glue("{trait} ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10"))
+  res <- summary(x <- glm(data = pheno, f1, family = "binomial"))$coefficients
+  res_noprs <- summary(x_noprs <- glm(data = pheno, f2, family = "binomial"))$coefficients
+  R2 <- NagelkerkeR2(x)$R2 - NagelkerkeR2(x_noprs)$R2
+  R2_res <- data.frame(R2)
+  rownames(R2_res) <- {trait}
+  R2_res <- R2_res %>% rownames_to_column("trait")
+  R2_res
+} 
+
+traits_bin <- colnames(pheno %>% 
+  select(where(~ all(. %in% c(0:1, NA)))) %>% 
+  select(!c(sex, MDD)))
+
+results_r2_bin <- map(traits_bin, olsR2_bin)
+names(results_r2_bin) <- traits_bin
+results_r2_bin_df <- rbindlist(results_r2_bin)
+
+# MDD 
+
+results_r2_MDD <- map("MDD", olsR2_bin)
+
+# continous
+
+olsR2_con <- function(trait) {
+  f1 <- glue("{trait} ~ mdd_prs_ldpred + sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10")
+  f2 <- as.formula(glue("{trait} ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10"))
+  res <- summary(x <- lm(data = pheno, f1))$coefficients
+  res_noprs <- summary(x_noprs <- lm(data = pheno, f2))$coefficients
+  R2 <- summary(x)$r.squared - summary(x_noprs)$r.squared
+  R2_res <- data.frame(R2)
+  rownames(R2_res) <- {trait}
+  R2_res <- R2_res %>% rownames_to_column("trait")
+  R2_res
+} 
+
+traits_con<- colnames(pheno %>% 
+  select(where(~ !all(. %in% c(0:1, NA)))) %>% 
+    select(!c(IID, mdd_prs_ldpred:yob))
+  )
+
+
+results_r2_con <- map(traits_con, olsR2_con)
+names(results_r2_con) <- traits_con
+results_r2_con_df <- rbindlist(results_r2_con)
+
+results_r2_df <- bind_rows(results_r2_bin_df, results_r2_con_df)
+
+fwrite(results_r2_df, "prs_results_r2_ldpred.tsv")
+
+kable(results_r2_df)
+
+
+```
+
+The F captures instrument strength. It is derived based on the R2 of the effect of the instrument (PRS) on the exposure (MDD), weighted by the target sample size and the number of instrument SNPs. For the classic instrument, we re-use the instruments from TSMR (same clumping thresholds were used for the PRS creation). We repeat the clumping steps to see which SNPs exactly are used as instruments for the ldpred2 instrument. Because the classic PRS explains very little variance in MDD, the instrument strength falls short of the cut-off of 10. For the ldpred2 PRS, the instrument strength was sufficient.
+
+``` {r F instrument strength}
+
+
+MDD_exp_dat <- fread("sumstats/instruments/MDD_exp_dat.tsv")
+
+MDD_exp_dat <- subset(MDD_exp_dat, select = SNP:`samplesize.exposure`)
+colnames(MDD_exp_dat) <- c("SNP", "EAF", "A1", "A2", "B", "SE", "P", "N")
+
+fwrite(MDD_exp_dat, "osmr_instrument_snps.txt")
+kable(col.names = "numer of SNPs for classic PRS", nrow(MDD_exp_dat))
+
+# Derive instrument strength for MDD
+
+MDDR2 <- as.numeric(data.frame(results_r2_MDD) %>% select(R2))
+
+N <- pheno %>% filter (!is.na(mdd_prs_pc)) %>% summarise(n=n())
+k <- MDD_exp_dat %>% summarise(n=n())
+
+F_classic = (MDDR2 * (N - k)) / ((1 - MDDR2) * k)
+
+kable(col.names = "R2 classic", MDDR2)
+kable(col.names = "F classic", F_classic)
+
+# To derive instrument strength for the LDpred2 prs, approximate k using more lenient clumping thresholds
+
+MDD_exp_dat_ldpred <- read_exposure_data("instruments/MDD_Als_looUKB_5e08.dat")
+# MDD_exp_dat_ldpred <- clump_data(MDD_exp_dat_ldpred, clump_r2 = 0.01, clump_kb = 1000)
+
+# Keep getting server errors using TSMR clump function, so I manually clumped with PLINK and read in the resulting SNP list
+
+#$PLINK --bfile g1000_eur --clump MDD_Als_looUKB_5e08.dat --clump-r2 0.01 --clump-kb 1000 --clump-field pval --out MDD_Als_looUKB_5e08
+# awk '{print $3}' MDD_Als_looUKB_5e08.clumped > MDD_Als_looUKB.clumped
+
+# snplist <- fread("sumstats/instruments/MDD_Als_looUKB.clumped")
+# MDD_exp_dat_ldpred <- MDD_exp_dat_ldpred %>% 
+#   inner_join(snplist)
+# fwrite(MDD_exp_dat_ldpred, "osmr_instrument_snps_ldpred.txt")
+
+MDD_exp_dat_ldpred <- fread("osmr_instrument_snps_ldpred.txt")
+k <- MDD_exp_dat_ldpred %>% summarise(n=n())
+
+kable(col.names = "number of SNPs for LDpred PRS", k)
+
+# Get R2 for the ldpred2 PRS
+f1 <- glue("MDD ~ mdd_prs_ldpred + sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10")
+f2 <- as.formula(glue("MDD ~ sex + yob + C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8 + C9 + C10"))
+res <- summary(x <- glm(data = pheno, f1, family = "binomial"))$coefficients
+res_noprs <- summary(x_noprs <- glm(data = pheno, f2, family = "binomial"))$coefficients
+MDDR2_ldpred <- NagelkerkeR2(x)$R2 - NagelkerkeR2(x_noprs)$R2
+N <- pheno %>% filter (!is.na(mdd_prs_ldpred)) %>% summarise(n=n())
+
+F_ldpred = (MDDR2_ldpred * (N - k)) / ((1 - MDDR2_ldpred) * k)
+
+kable(col.names = "R2 LDpred", MDDR2_ldpred)
+kable(col.names = "F LDpred", F_ldpred)
+
+fwrite(F_classic, "MDD_instrument_classic_prs_F.tsv")
+fwrite(F_ldpred, "MDD_instrument_ldpred2_prs_F.tsv")
+
+```
+
+Derive sample size for each outcome in order to provide context for effect size interpretation. 
+
+``` {r N}
+
+N_bin <- function(trait) {
+  n <- pheno %>% 
+    filter(!is.na(.[[trait]])) %>% 
+    group_by(.[[trait]]) %>% 
+    summarise(n=n())
+  
+  a <- data.frame(outcome = trait, case = n$`.[[trait]]`, N = n$n) %>% 
+    mutate(case = recode(case, `0` = "N_control", `1` = "N_cases"))
+  
+  b <- a %>% 
+    pivot_wider(names_from = case, values_from = N) %>% 
+    mutate(N = N_control + N_cases)
+  
+  b
+}
+
+N_bin_res <- map(traits_bin, N_bin)
+
+
+
+
+N_con <- function(trait) {
+  n <- pheno %>% 
+    filter(!is.na(.[[trait]])) %>% 
+    summarise(N=n())
+  
+  data.frame(outcome = trait, N = n$N)
+}
+  
+  
+ N_con_res <- map(traits_con, N_con) 
+  
+
+N <- bind_rows(rbindlist(N_bin_res), rbindlist(N_con_res))
+
+fwrite(N, "N.tsv")
+
+```
+
+# OSMR diagnostics
+
+From the TSLS analyses, extract the diagnostics for weak instrument bias. If the Weak instruments parameter is significant, this indicates that the instrument is not a strong instrument for the exposure. The Wu-Hausman parameter is a test of endogeneity. If it is significant it indicates that 2SLS is not consistent with the standard OLS estimate, indicating that the 2SLS is preferred. These are the diagnostics using the classic PRS:
+
+``` {r diag}
+
+weakinstrumentdiag <- function(trait) {
+    f <- glue("{trait} ~ MDD  | 
+             mdd_prs_pc")
+    diag <- (summary(ivreg(f, data=pheno)))$diagnostics 
+    data.frame(diag, outcome = trait) %>% 
+      filter(row.names(diag) == "Weak instruments")
+}
+
+weakinstrumentbin <- map(traits_bin, weakinstrumentdiag)
+weakinstrumentcon <- map(traits_con, weakinstrumentdiag)
+weakinstrument <- rbind(rbindlist(weakinstrumentbin), rbindlist(weakinstrumentcon)) %>% 
+  rename(weakinstrument = statistic, p_weakinstruments = `p.value`)
+
+wuhausmandiag <- function(trait) {
+    f <- glue("{trait} ~ MDD  | 
+             mdd_prs_pc")
+    diag <- (summary(ivreg(f, data=pheno)))$diagnostics 
+    data.frame(diag, outcome = trait) %>% 
+      filter(row.names(diag) == "Wu-Hausman")
+}
+
+wuhausmanbin <- map(traits_bin, wuhausmandiag)
+wuhausmancon <- map(traits_con, wuhausmandiag)
+wuhausman <- rbind(rbindlist(wuhausmanbin), rbindlist(wuhausmancon)) %>% 
+  rename(wuhausman = statistic, p_wuhausman = `p.value`) %>% 
+  select(outcome, wuhausman, p_wuhausman)
+
+diag <- wuhausman %>% inner_join(weakinstrument)
+
+kable(diag)
+
+fwrite(diag, "osmr_diagnostics.tsv")
+
+
+```
+
+And these are the diagnostics for the LDpred2 PRS:
+
+```{R diag ldpred}
+
+
+weakinstrumentdiag <- function(trait) {
+    f <- glue("{trait} ~ MDD  | 
+             mdd_prs_ldpred")
+    diag <- (summary(ivreg(f, data=pheno)))$diagnostics 
+    data.frame(diag, outcome = trait) %>% 
+      filter(row.names(diag) == "Weak instruments")
+}
+
+weakinstrumentbin <- map(traits_bin, weakinstrumentdiag)
+weakinstrumentcon <- map(traits_con, weakinstrumentdiag)
+weakinstrument <- rbind(rbindlist(weakinstrumentbin), rbindlist(weakinstrumentcon)) %>% 
+  rename(weakinstrument = statistic, p_weakinstruments = `p.value`)
+
+wuhausmandiag <- function(trait) {
+    f <- glue("{trait} ~ MDD  | 
+             mdd_prs_ldpred")
+    diag <- (summary(ivreg(f, data=pheno)))$diagnostics 
+    data.frame(diag, outcome = trait) %>% 
+      filter(row.names(diag) == "Wu-Hausman")
+}
+
+wuhausmanbin <- map(traits_bin, wuhausmandiag)
+wuhausmancon <- map(traits_con, wuhausmandiag)
+wuhausman <- rbind(rbindlist(wuhausmanbin), rbindlist(wuhausmancon)) %>% 
+  rename(wuhausman = statistic, p_wuhausman = `p.value`) %>% 
+  select(outcome, wuhausman, p_wuhausman)
+
+diag <- wuhausman %>% inner_join(weakinstrument)
+
+kable(diag)
+
+fwrite(diag, "osmr_diagnostics_ldpred.tsv")
+
+```
+
+# Weighted median and MR Egger
+
+In order to get the MR median and MR Egger estimates we need the per-SNP association results for the exposure (MDD, already available from the GWAS) and the outcomes. Using PLINK, we estimate the association between the instrument SNPs (the set of 150 from the classic C+PT PRS) and each outcome. Relying on the TwoSampleMR package, we then harmonize the results for the exposure and the outcomes and perform standard TSMR analysis.
+
+``` {r prep data for plink assoc}
+
+# First, perform plink assoc tests for the outcomes to get beta.outcome and se.outcome
+# Prep the data
+
+pheno <- fread("ukb_mr2outcomes_clean.tsv")
+
+traits_bin <- colnames(pheno %>% 
+  select(where(~ all(. %in% c(0:1, NA)))) %>% 
+  select(!c(sex, MDD)))
+
+traits_con<- colnames(pheno %>% 
+  select(where(~ !all(. %in% c(0:1, NA)))) %>% 
+    select(!c(IID, mdd_prs_ldpred:yob))
+  )
+
+
+pheno_bin <- pheno %>% mutate(FID = IID) %>% select(c(FID, IID, traits_bin)) %>% mutate_at(traits_bin, funs(recode(.,`1` = 2, `0` = 1))) 
+pheno_con <- pheno %>% mutate(FID = IID) %>% select(c(FID, IID, traits_con)) 
+pheno_covar <- pheno %>% mutate(FID = IID) %>% select(c(FID, IID, sex, yob, C1:C10)) %>% mutate(sex = recode(sex, `1` = 2, `0` = 1))
+
+fwrite(pheno_bin, "ukb_pheno_bin_for_assoc.txt", sep = "\t", quote = FALSE, row.names = FALSE, na = NA)
+fwrite(pheno_con, "ukb_pheno_con_for_assoc.txt", sep = "\t", quote = FALSE, row.names = FALSE, na = NA)
+fwrite(pheno_covar, "ukb_pheno_covar_for_assoc.txt", sep = "\t", quote = FALSE, row.names = FALSE, na = NA)
+
+```
+
+```{bash assoc, eval = FALSE}
+
+# move to Linux to perform the association tests
+cd $COMORMENT/
+
+echo -en '#!/bin/bash
+#SBATCH --job-name=plink_assoc
+#SBATCH -t 1:00:00
+#SBATCH --array=1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22
+
+for SLURM_ARRAY_TASK_ID in  1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22;
+do 
+$PLINK \
+    --bfile ukb_imp_chr${SLURM_ARRAY_TASK_ID}_v3_maf_0.01_hm3 \
+    --extract OneSampleMR/MDD.topsnps \
+    --allow-no-sex \
+    --pheno OneSampleMR/ukb_pheno_con_for_assoc.txt \
+    --all-pheno \
+    --linear \
+    --ci 0.95 \
+    --covar OneSampleMR/ukb_pheno_covar_for_assoc.txt \
+    --out OneSampleMR/chr${SLURM_ARRAY_TASK_ID}
+done 
+
+for SLURM_ARRAY_TASK_ID in  1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22;
+do 
+$PLINK \
+    --bfile ukb_imp_chr${SLURM_ARRAY_TASK_ID}_v3_maf_0.01_hm3 \
+    --extract OneSampleMR/MDD.topsnps \
+    --allow-no-sex \
+    --pheno OneSampleMR/ukb_pheno_bin_for_assoc.txt \
+    --all-pheno \
+    --logistic \
+    --ci 0.95 \
+    --covar OneSampleMR/ukb_pheno_covar_for_assoc.txt \
+    --out OneSampleMR/chr${SLURM_ARRAY_TASK_ID}
+done 
+
+' > OneSampleMR/plink_assoc.sh
+
+
+# Move results file to working directory
+    
+```
+
+```{r process assoc results, eval = F}
+
+extractassoc <- function(trait) {
+  
+  trait_files <- list.files(path = "plinkassoc/", pattern = trait, full.names = T)
+  x <- rbindlist(lapply(trait_files, fread), fill = TRUE)
+  
+  if (!"BETA" %in% colnames(x)) 
+  {x <- x %>% mutate(BETA = NA)}
+  if (!"OR" %in% colnames(x)) 
+  {x <- x %>% mutate(OR = NA)}
+  
+  x %>% 
+    filter(TEST == "ADD") %>% 
+    mutate(BETA = ifelse(is.na(BETA), log(OR), BETA)) %>% 
+    select(SNP, CHR, BP, A1, NMISS, BETA, SE, P) %>% 
+    mutate(outcome = {{trait}})
+}
+
+assocres <- map(traits, extractassoc)
+names(assocres) <- traits
+
+outputdir <- "plinkassoc"
+
+for (i in seq_along(assocres)) {
+  filename <- paste0(names(assocres)[i], "_plinkres.tsv")
+  filepath <- file.path(outputdir, filename)
+  fwrite(assocres[[i]], filepath)
+}
+
+```
+
+These are the weighted median results using the classic C+PT PRS, as well as the MR-Egger tests of pleiotropy:
+```{r perform MR}
+
+# First using the instruments from the classic C+PT PRS
+
+MDD_exp_dat <- fread("sumstats/instruments/MDD_exp_dat.tsv")
+outcomefiles <- list.files(path = "plinkassoc/", pattern = "plinkres.tsv", full.names = T)
+
+outcomedata <- list()
+for (f in 1:length(outcomefiles)) {
+              outcomedata[[f]] <- read_outcome_data(snps = MDD_exp_dat$SNP,
+              filename = outcomefiles[f],
+              sep = ",",
+              snp_col = "SNP",
+              beta_col = "BETA",
+              se_col = "SE",
+              effect_allele_col = "A1",
+              pval_col = "P", 
+              phenotype_col="outcome")
+}
+              
+MDD_outcome <- list()
+for (i in 1:length(outcomedata)) {
+  MDD_outcome[[i]] <- harmonise_data(
+    exposure_dat = MDD_exp_dat, 
+    outcome_dat = outcomedata[[i]]
+  )
+}
+
+# Because the outcome files didn't have other allele, mr_keep parameter will filter them all out. Instead, filter on 'remove' column
+for (i in 1:length(outcomedata)) {
+  MDD_outcome[[i]] <- subset(MDD_outcome[[i]], remove == F)
+  MDD_outcome[[i]] <- MDD_outcome[[i]] %>% mutate(mr_keep = TRUE)
+}
+
+saveRDS(MDD_outcome, "MDD-outcome_data_osmr.RDS")
+
+res_mr <- map(MDD_outcome, mr)
+res_pleio <- map(MDD_outcome, mr_pleiotropy_test)
+
+fwrite(rbindlist(res_mr), "osmr_results_classic.tsv")
+fwrite(rbindlist(res_pleio), "osmr_pleio_classic.tsv")
+
+kable(
+  rbindlist(res_mr) %>% 
+    select(!c(id.exposure, id.outcome)) %>% 
+    filter(method == "Weighted median" | method == "Weighted mode")
+)
+
+kable(
+  rbindlist(res_pleio) %>% 
+  select(!c(id.exposure, id.outcome)) 
+)
+
+```
+
+For the LDpred PRS, we don't actually know which SNPs are weighted in the PRS. Still, we want to get some idea of how pleiotropic these instruments are likely to be. To derive instrument strength before we approximated the instruments by clumping at a more lenient threshold, which was actually a conservative choice considering that about 20% of the genome is taken into account in the LDpred weighting algorithm. To estimate pleiotropy, this choice should be considered liberal, because pleiotropy is more likely to occur when more SNPs are included. This should be considered when interpreting below pleiotropy estimates.
+
+```{r perform MR for ldpred instruments}
+
+# Using the approximation of the SNPs in the LDpred PRS with less conservative clumping
+
+MDD_outcome_ldpred <- list()
+
+for (i in 1:length(outcomedata)) {
+  MDD_outcome_ldpred[[i]] <- harmonise_data(
+    exposure_dat = MDD_exp_dat_ldpred, 
+    outcome_dat = outcomedata[[i]]
+  )
+}
+
+for (i in 1:length(outcomedata)) {
+  MDD_outcome_ldpred[[i]] <- subset(MDD_outcome_ldpred[[i]], remove == F)
+  MDD_outcome_ldpred[[i]] <- MDD_outcome_ldpred[[i]] %>% mutate(mr_keep = TRUE)
+}
+
+res_mr_ldpred <- map(MDD_outcome_ldpred, mr)
+res_pleio_ldpred <- map(MDD_outcome_ldpred, mr_pleiotropy_test)
+
+fwrite(rbindlist(res_mr_ldpred), "osmr_results_ldpred.tsv")
+fwrite(rbindlist(res_pleio_ldpred), "osmr_pleio_ldpred.tsv")
+
+kable(
+  rbindlist(res_pleio_ldpred) %>% 
+  select(!c(id.exposure, id.outcome)) 
+)
+
+```
+# Phenotypic association
+
+As a sanity check, also compute the association between MDD and the outcomes using observational data only.
+
+``` {r phenotypic correlation}
+
+# Binary
+ols_bin <- function(trait) {
+  f1 <- glue("{trait} ~ MDD + sex + yob")
+  res <- data.frame(summary(x <- glm(data = pheno, f1, family = "binomial"))$coefficients)
+  res <- res %>% filter(row.names(res) == "MDD")
+  R2 <- NagelkerkeR2(x)$R2
+  data.frame(cbind(res, R2, trait))
+} 
+
+results_ols_bin <- map(traits_bin, ols_bin)
+results_ols_bin_df <- rbindlist(results_ols_bin) %>% 
+  select(!"z.value")
+colnames(results_ols_bin_df) <- c("b", "se", "p", "R2", "outcome")
+
+
+
+# Continuous
+ols_con <- function(trait) {
+  f1 <- glue("{trait} ~ MDD + sex + yob")
+  res <- data.frame(summary(x <- lm(data = pheno, f1))$coefficients)
+  res <- res %>% filter(row.names(res) == "MDD")
+  R2 <- summary(x)$r.squared
+  data.frame(cbind(res, R2, trait))
+} 
+
+results_ols_con <- map(traits_con, ols_con)
+results_ols_con_df <- rbindlist(results_ols_con) %>% 
+  select(!"t.value")
+colnames(results_ols_con_df) <- c("b", "se", "p", "R2", "outcome")
+
+results_ols_df <- rbind(results_ols_bin_df, results_ols_con_df)
+fwrite(results_ols_df, "phenotypic_ols.tsv")
+
+kable(results_ols_df)
+
+```
+For the power analysis, also compute the OLS association in the other direction. 
+
+``` {r reverse phenotypic correlation}
+
+# Binary
+ols_r_bin <- function(trait) {
+  f1 <- glue("MDD ~ {trait} + sex + yob")
+  res <- data.frame(summary(x <- glm(data = pheno, f1, family = "binomial"))$coefficients)
+  res <- res %>% filter(row.names(res) == trait)
+  R2 <- NagelkerkeR2(x)$R2
+  data.frame(cbind(res, R2, trait))
+} 
+
+results_ols_r_bin <- map(traits_bin, ols_r_bin)
+results_ols_r_bin_df <- rbindlist(results_ols_r_bin) %>% 
+  select(!"z.value")
+colnames(results_ols_r_bin_df) <- c("b", "se", "p", "R2", "exposure")
+
+fwrite(results_ols_r_bin_df, "phenotypic_reversed_ols.tsv")
+
+kable(results_ols_r_bin_df)
+
+```
+

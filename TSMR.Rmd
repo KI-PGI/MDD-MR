@@ -1,0 +1,1568 @@
+--
+title: "PheWide two-sample MR between MDD and risk factors/ outcomes"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    collapsed: true
+    theme: united
+---
+
+# PheWide two-sample MR between MDD and risk factors/ outcomes
+
+The project focuses on causal relationships between risk factors and outcomes in MDD. The first part will be TwoSample MR. We start with MDD as exposure. Part 2 of this file is with MDD as outcome.
+
+```{r setup, include=FALSE, eval=TRUE}
+
+
+library(tidyverse)
+library(data.table)
+library(TwoSampleMR)
+library(ggforestplot)
+library(ggplot2)
+library(svglite)
+library(simex)
+library(MRPRESSO)
+library(eoffice)
+library(knitr)
+library(survey)
+library(gsmr)
+library(furrr)
+library(purrr)
+library(readxl)
+library(lhcMR)
+
+knitr::opts_knit$set(root.dir = "")
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, error=FALSE)
+
+path1 <- "" # path to summary statistics data
+path2 <- "" # path to summary statistics data
+
+
+```
+
+
+# MDD as exposure 
+
+## Data preparation steps
+
+First, we create the MDD instrument, using a threshold of p<5e-08 and an R2<0.01. It is based on Als et al 2023 leaving out UK-Biobank. 
+
+```{r Create instruments}
+
+# Extract hits 
+
+MDD <- fread("sumstats/MDD_Als_looUKB_tidy.tsv.gz")
+
+MDDhits <- MDD %>% 
+  filter(P<5e-08) %>%
+  rename(Phenotype = OUTCOME) %>% 
+  rename(effect_allele = A1) %>% 
+  rename(other_allele = A2) %>% 
+  rename(eaf=EAF) %>% 
+  rename(beta=B) %>% 
+  rename(se=SE) %>% 
+  rename(pval=P) %>% 
+  rename(samplesize=N)
+
+fwrite(MDDhits, "sumstats/MDD_Als_looUKB_5e08.dat", sep=" ", quote=F, na=NA)
+
+# Reading in the exposure files & clumping
+
+MDD_exp_dat <- read_exposure_data("sumstats/MDD_Als_looUKB_5e08.dat")
+MDD_exp_dat <- clump_data(MDD_exp_dat, clump_r2 = 0.01)
+
+MDD_exp_dat %>% 
+  group_by(exposure) %>% 
+  summarise(IV_SNPs=n())
+
+fwrite(MDD_exp_dat, "sumstats/instruments/MDD_exp_dat.tsv")
+
+
+```
+
+
+We prepare and format the summary statistics that we'll use as outcomes. We select based on N and results from LDSC (h2) as saved to the TraitSelection overview file. These are the selected traits:
+
+```{r Select outcomes}
+
+# Traits that survive the selection criteria
+
+sumstats <- read_excel("trait_selection/TraitSelection.xlsx", na=c("", NA)) 
+
+traitsfortsmr <- sumstats %>% 
+  filter((includeLDSC == 1 & `Reported hits` > 4 & (scale_h2 > 0.03 | liability_h2 > 0.03)) | Category == "Suicide") %>% 
+  select(`GWAS trait`, shorttraitname, Category, `Reported hits`, N, N_CAS, liability_h2, scale_h2)
+
+kable(sumstats)
+
+fwrite(traitsfortsmr, "trait_selection/TSMR_selected.tsv")
+
+traitsfortsmr %>% summarise(`Number of traits`=n())
+
+
+```
+
+Next, we will check if the instrument SNPs are all present in the outcome data files and harmonize the dataframes. This is the list of traits we include:
+
+
+```{r Harmonize exposure-outcome data}
+
+# For each instrument - outcome combination, we look up the instrument SNPs in the outcome data.
+
+files <- list.files(path="sumstats/tidygwas", pattern= glob2rx("*_tidy.tsv.gz"), full.names = T)
+sel <- traitsfortsmr %>% mutate(filename = paste0("sumstats/tidygwas/", shorttraitname, "_tidy.tsv.gz"))
+sel <- sel$filename
+
+outcomedata <- list()
+for (f in 1:length(selfiles)) {
+              outcomedata[[f]] <- read_outcome_data(snps = MDD_exp_dat$SNP,
+              filename = selfiles[f],
+              sep = "\t",
+              snp_col = "SNP",
+              beta_col = "B",
+              se_col = "SE",
+              effect_allele_col = "A1",
+              other_allele_col = "A2",
+              eaf_col = "EAF",
+              pval_col = "P", 
+              ncase="N_CAS",
+              ncontrol="N_CON",
+              samplesize_col="N", 
+              phenotype_col="OUTCOME")
+}
+              
+saveRDS(outcomedata, "MDD-outcome_data.RDS")
+
+
+####
+# Harmonize
+
+MDD_outcome <- list()
+for (i in 1:length(outcomedata)) {
+  MDD_outcome[[i]] <- harmonise_data(
+    exposure_dat = MDD_exp_dat, 
+    outcome_dat = outcomedata[[i]]
+  )
+}
+
+# Keep only filtered SNPs
+for (i in 1:length(outcomedata)) {
+  MDD_outcome[[i]] <- subset(MDD_outcome[[i]], mr_keep==T)
+}
+
+# write harmonized files to tables for information on SNPs
+for (i in 1:length(outcomedata)) {
+  fwrite(outcomedata[[i]], paste0("sumstats/harmonized/", outcomedata[[i]]$outcome[[1]], "_harmonized.txt"))
+}
+
+saveRDS(MDD_outcome, "MDD-outcome_harmonized.RDS")
+
+```
+
+## Main analyses
+
+We run MR with and without Steiger-filtering (removing SNPs that explain more variance in the outcome than in the exposure, i.e., have horizontal pleiotropy). Note that the MR-Egger results should not beinterpreted, because most require SIMEX-correction according to the I-squared results (see below).
+
+```{r Main analyses, echo=F, results='hide'}
+
+# Read in data 
+MDD_outcome <- readRDS("MDD-outcome_harmonized.RDS")
+
+mr_res <- MDD_outcome %>%
+  map(mr)
+
+# IVW results plot
+
+MRres_forplot <- rbindlist(mr_res) %>% 
+  filter(method=="Inverse variance weighted")
+
+MRres_plot <- forestplot(MRres_forplot, 
+           title="MR results (IVW) before Steiger filtering",
+           name=outcome, 
+           estimate = b, 
+           se=se, 
+           colour = exposure,
+           xlab="Beta",
+           ylab="Outcome"
+           )
+
+ggsave("results/plots/MDD_outcome.svg",  MRres_plot, device = "svg", width = 20, height = 40, units = "cm")
+
+
+####
+# Steiger filter all analyses
+
+# Need some extra columns to determine R2 for MDD
+for (i in 1:length(MDD_outcome)) {
+  MDD_outcome[[i]] <- MDD_outcome[[i]] %>% 
+    mutate(units.exposure="log_odds") %>%
+    mutate(ncase.exposure=166773) %>% 
+    mutate(ncontrol.exposure=507679) %>% 
+    mutate(prevalence.exposure=166773/(166773+507679)) %>% 
+    mutate(units.outcome=ifelse(!is.na(ncase.outcome) & !is.na(ncontrol.outcome), "log_odds", "")) %>% 
+    mutate(prevalence.outcome=ifelse(!is.na(ncase.outcome) & !is.na(ncontrol.outcome), ncase.outcome/samplesize.outcome, NA))
+}
+
+# Determine which SNPs explain more variance in the outcome
+MDD_outcome <- MDD_outcome %>% 
+  map(steiger_filtering)
+
+# Re-run while filtering out SNPs that are in the wrong direction and explain more variance in the outcome than in the exposure (dir=TRUE). Note I do not filter out based on p-value as this is too stringent.
+st_res <- list()
+for (i in 1:length(MDD_outcome)) {
+  st_res[[i]] <- mr(subset(MDD_outcome[[i]], !(MDD_outcome[[i]]$steiger_pval < 0.05 & MDD_outcome[[i]]$steiger_dir == FALSE)))
+}
+
+# Scatter plots after Steiger filtering (subset list of results based on length; if length is 0 there were no snps left after filtering)
+# st_res <- keep(st_res, ~ nrow(.) >0)
+# MDD_outcome_st <- keep(MDD_outcome, ~ any(.$steiger_dir))
+
+for (i in 1:length(st_res)) {
+  res1 <- st_res[[i]]
+  dat1 <- MDD_outcome[[i]]
+  name <- paste0("scatter_",res1[1,4],"_",res1[1,3],"_steiger")
+  p_save <- mr_scatter_plot(res1,dat1)[[1]] + 
+    theme_bw() + theme(legend.position = "top")
+  ggsave(plot = p_save, filename = paste0("results/plots/",name,".svg"))
+}
+
+
+# IVW results plots after Steiger filtering
+
+MRst_forplot <- rbindlist(st_res) %>% 
+  filter(method=="Inverse variance weighted")
+
+MRst_plot <- forestplot(MRst_forplot, 
+           title="MR results (IVW) after Steiger filtering",
+           name=outcome, 
+           estimate = b, 
+           se=se, 
+           colour = exposure,
+           xlab="Beta",
+           ylab="Outcome"
+           )
+
+ggsave("results/plots/mainresults_steiger.svg", MRst_plot, device = "svg", width = 25, height = 40, units = "cm")
+
+MRst_df <- rbindlist(st_res, use.names = T) %>% 
+  select(-id.exposure, -id.outcome)
+
+
+MRres <- rbindlist(mr_res, use.names = T) %>% 
+  select(-id.exposure, -id.outcome)
+
+fwrite(MRres, "results/mainresults.tsv")
+fwrite(MRst_df, "results/mainresults_steiger.tsv")
+
+
+saveRDS(MDD_outcome, "results/MDD-outcome_foranalysis.rds")
+saveRDS(mr_res, "results/mr_res.rds")
+saveRDS(st_res, "results/st_res.rds")
+
+```
+
+
+**Full results including sensitivity analyses before Steiger filtering:**
+
+
+
+```{r Main results}
+
+kable(MRres)
+
+```
+
+
+## Sensitivity analyses
+
+Sensitivity analyses and follow-ups are performed to test the robustness of the results.
+
+### Pleiotropy
+
+First, using MR Egger, we test if there is pleiotropy, for the uncorrected corrected results. Steiger filters out specific pleiotropic SNPs (that have a relationship with the outcome), but other sources of pleiotropy may be detected by MR Egger.
+
+```{r Pleiotropy}
+
+# MR-Egger intercept before Steiger filtering.
+
+MEintercept <- list()
+for (i in 1:length(MDD_outcome)) {
+  res <- data.frame(mr_pleiotropy_test(MDD_outcome[[i]]))
+  MEintercept[[i]] <- res
+}
+
+MEintercept <- rbindlist(MEintercept)
+kable(MEintercept %>% 
+  select(exposure, outcome, egger_intercept, se, pval))
+
+fwrite(MEintercept, "results/MR-Egger_intercept.tsv")
+
+```
+
+
+In addition, we use MR-PRESSO (Mendelian Randomization Pleiotropy RESidual Sum and Outlier) to assess horizontal pleiotropy.
+
+```{r MR-PRESSO, eval=F}
+# Run on a cluster (if not already there)
+
+presso <- function(x) {
+   mr_presso(data=data.frame(x),
+                              BetaOutcome = "beta.outcome", 
+                              BetaExposure = "beta.exposure", 
+                              SdOutcome = "se.outcome", 
+                              SdExposure = "se.exposure", 
+                              OUTLIERtest = TRUE, DISTORTIONtest = TRUE,
+                              NbDistribution = 10000, 
+                              SignifThreshold = 0.05)
+}
+
+plan(multisession, workers = 30)
+res <- future_map(MDD_outcome, presso)
+
+saveRDS(res, "results/presso.rds")
+
+presso_res <- list()
+for (i in 1:length(res)) {
+  presso_res[[i]] <- res[[i]]$`Main MR results`
+}
+
+n_presso <- list()
+for (i in 1:length(res)) {
+  n_presso[[i]] <- data.frame(nrow(res[[i]]$`MR-PRESSO results`$`Outlier Test`))
+}
+
+outcome_name_vector <- vector()
+for (i in 1:length(MDD_outcome)) {
+  outcome_name_vector[[i]] <- MDD_outcome[[i]]$outcome[[1]]
+}
+
+names(presso_res) <- outcome_name_vector
+names(n_presso) <- outcome_name_vector 
+
+presso_res <- rbindlist(presso_res, use.names=T, idcol = T) %>% 
+  mutate(Exposure="MDD") %>% 
+  rename(Outcome = ".id")
+
+
+n_presso <- rbindlist(n_presso, use.names=T, idcol = T)
+
+colnames(n_presso) <- c("Outcome", "nsnps_presso")
+
+presso_res <- presso_res %>% 
+  full_join(n_presso)
+
+fwrite(presso_res, "results/presso_res.tsv")
+
+``` 
+
+```{r MR presso results}
+
+presso_res <- fread("results/presso_res.tsv")
+
+presso_res %>% dplyr::mutate_if(is.numeric, funs(as.character(signif(., 3)))) %>%
+    kable(.)
+
+```
+
+
+### R-squared
+
+In the Steiger-filtering step, the R-squared was derived to assess the variance explained by each independent SNP in the exposure. We sum the R-squareds of each instrument to get a sense of instrument strength. Note that due to harmonizing we have different numbers of IVs in each of the analyses. In the final iteration these numbers should be closer, so that we have uniform estimates of instrument strength of the same instrument used to predict different outcomes.
+
+```{r R-squared}
+
+# Extract list of R-squared for each dataframe
+r2 <- list()
+for (i in 1:length(MDD_outcome)) {
+  r2[[i]] <- tibble(MDD_outcome[[i]]$outcome[[1]], sum(MDD_outcome[[i]]$rsq.exposure))
+}
+
+res_r2 <- (rbindlist(r2))
+colnames(res_r2) <- c("outcome", "Rsq")
+kable(res_r2)
+
+fwrite(r2, "results/instrumentR2.tsv")
+```
+
+
+### I-squared and F-statistic
+
+In this code chunk, I-squared is computed to assess if the MR Egger can be interpreted, or needs to be SIMEX-corrected. For each analysis, the heighest (unweighted or weighted) Isq should be interpreted. If it's below .9 but above .6 a SIMEX correction should be performed. If it's below .6 it should not be reported at all. If it's above .9 no correction is needed.
+
+In the same run, we assess instrument strength by estimating the F-statistic. An F above 10 is considered acceptable instrument strength. 
+
+```{r Isq and F statistic}
+
+MDD_outcome <- readRDS("results/MDD-outcome_foranalysis.rds")
+
+# I-squared function to check suitability MR-Egger
+# This script and the MR-SIMEX function further below
+# are based on Bowden et al.(2016) 
+# Script originally from Robyn Wootton - 07/03/2018
+# Received from Jorien Treur - Oct 2022
+# Rewritten into functions Joëlle Pasman - Nov 2022
+
+Isq <- function(y,s){
+  k          = length(y)
+  w          = 1/s^2; sum.w  = sum(w)
+  mu.hat     = sum(y*w)/sum.w  
+  Q          = sum(w*(y-mu.hat)^2)
+  Isq        = (Q - (k-1))/Q
+  Isq        = max(0,Isq)
+  return(Isq)
+}
+
+
+appendIsq <- function(x) {
+  x %>% 
+      rename(BetaXG = beta.exposure, seBetaXG = se.exposure, seBetaYG = se.outcome) %>%
+      mutate(BXG = abs(BetaXG)) %>%
+      mutate(Isq_unweighted=Isq(BXG,seBetaXG)) %>% 
+      mutate(Isq_weighted=Isq((BXG/seBetaYG),(seBetaXG/seBetaYG))) %>% 
+      mutate(Isq_max=pmax(Isq_unweighted, Isq_weighted)) %>% 
+      mutate(Isq_max_weighted=ifelse(Isq_weighted>Isq_unweighted, "weighted", "unweighted")) %>% 
+      mutate(Fstatistic = BXG^2/seBetaXG^2) %>% 
+      mutate(mFstatistic = mean(Fstatistic))
+}
+
+MDD_outcome_f <- list()
+for (i in 1:length(MDD_outcome)) {
+  MDD_outcome_f[[i]] <- appendIsq(MDD_outcome[[i]])
+}
+
+
+isqs <- list()
+for (i in 1:length(MDD_outcome_f)) {
+  isqs[[i]] <- MDD_outcome_f[[i]] %>%
+      group_by(exposure, outcome) %>% 
+      summarise(Isq_max=max(Isq_max), mean_Fstatistic=max(mFstatistic), Isq_weight=first(Isq_max_weighted)) %>% 
+      mutate(SIMEX=ifelse(Isq_max>0.6 & Isq_max<0.9, "SIMEX_egger", NA)) %>% 
+      mutate(SIMEX=ifelse(Isq_max>0.9, "Standard_egger", SIMEX)) %>%
+      mutate(SIMEX=ifelse(Isq_max<0.6, "No_egger", SIMEX)) %>% 
+      mutate(Instrument_strength=ifelse(mean_Fstatistic<10, "weak", "sufficient"))
+}
+
+
+isqs <- rbindlist(isqs)
+
+kable(isqs)
+
+fwrite(isqs, "results/Isquared_F.tsv")
+
+```
+
+### SIMEX-correction for MR-Egger
+
+The instrument strength is sufficient for all analyses. I-squared indicates that 2 MR Egger analyses need to be corrected using SIMEX. 
+
+```{r SIMEX, eval=F}
+
+simexfunction <- function(x) {
+  
+  Isq_max <- x$Isq_max[1]
+  
+  if (Isq_max < 0.6 | Isq_max > 0.9) {return(NULL)}
+  
+  if (x$Isq_max_weighted[[1]] == "weighted") {
+    x_trans <- x %>% mutate(y = beta.outcome * sign(BetaXG), exposure = abs(BetaXG), W = 1/seBetaYG^2)
+    simexmodel <- lm(y ~ exposure, weights = W,  data = x_trans, x = TRUE, y = TRUE)
+    simexmodel$model$W <- simexmodel$model$`(weights)`
+  }
+  
+  if (x$Isq_max_weighted[[1]] == "unweighted") {
+    x_trans <- x %>% mutate(y = beta.outcome, exposure = abs(BetaXG))
+    simexmodel <- lm(y ~ exposure, data = x_trans, x = TRUE, y = TRUE)
+  }
+  
+  res <- summary(simex(model = simexmodel,
+                       B = 10000,
+                       measurement.error = x_trans$seBetaXG,
+                       SIMEXvariable = "exposure",
+                       fitting.method = "quad",
+                       asymptotic = "FALSE"))
+  
+  res$coefficients
+}
+
+simex_res <- MDD_outcome_f %>%
+  map(simexfunction)
+
+saveRDS(MDD_outcome_f, "MDD_outcome_f.rds")
+
+
+outcome_name_vector <- vector()
+for (i in 1:length(MDD_outcome_f)) {
+  outcome_name_vector[[i]] <-  MDD_outcome_f[[i]]$outcome[[1]]
+}
+
+names(simex_res) <- outcome_name_vector
+
+unnested <- compact(simex_res)
+for (i in 1:length(unnested)) {
+  unnested[[i]] <- data.frame(unnested[[i]]$jackknife)
+  unnested[[i]] <- unnested[[i]]["exposure",]
+  colnames(unnested[[i]]) <- c("simex_estimate", "simex_SE", "simex_t-value", "simex_p-value")
+}
+
+unnested <- rbindlist(unnested, use.names = T, id=T)
+unnested <- unnested %>% rename(outcome=.id)
+
+simex_results <- full_join(isqs, unnested)
+fwrite(simex_results, "results/MDD_as_outcome/simex_corrected.tsv")
+
+```
+
+These are the results for the SIMEX-corrected MR-Egger estimates: 
+
+```{r simex results}
+
+simex_results <- fread("results/MDD_as_outcome/simex_corrected.tsv")
+kable(simex_results)
+
+```
+
+
+### Heterogeneity 
+
+The code below assesses heterogeneity using Cochran's Q, leave-one-out analysis, and single-snp analysis. All leave-one-out and funnel plots are written to the results directory. 
+
+```{r Heterogeneity analyses, echo=F, results='hide'}
+
+# Leave-one-out analysis
+
+for (i in 1:length(MDD_outcome)) {
+  loores <- data.frame(mr_leaveoneout(MDD_outcome[[i]]))
+  name <- paste0("loo_",loores[[c(1, 1)]],"_",loores[[c(2, 1)]][1])
+  p_save <- mr_leaveoneout_plot(loores)[[1]] 
+  ggsave(plot = p_save, filename = paste0("results/plots/",name,".svg"))
+}
+
+
+# Single SNP analysis
+
+for (i in 1:length(MDD_outcome)) {
+  singleres <- data.frame(mr_singlesnp(MDD_outcome[[i]]))
+  name <- paste0("funnel_",singleres[[c(1, 1)]],"_",singleres[[c(2, 1)]][1])
+  p_save <- mr_funnel_plot(singleres)[[1]] 
+  ggsave(plot = p_save, filename = paste0("results/plots/",name,".svg"))
+}
+
+# cochran's Q
+
+Q <- list()
+for (i in 1:length(MDD_outcome)) {
+  Qres <- data.frame(mr_heterogeneity(MDD_outcome[[i]]))
+  Q[[i]] <- Qres
+}
+
+Qst <- list()
+for (i in 1:length(MDD_outcome)) {
+  Qstres <- data.frame(mr_heterogeneity(subset(MDD_outcome[[i]], MDD_outcome[[i]]$steiger_dir==TRUE)))
+  Qst[[i]] <- Qstres
+}
+
+Q <- rbindlist(Q) 
+Qst <- rbindlist(Qst)
+
+fwrite(Q, "results/Q-heterogeneity.tsv")
+fwrite(Qst, "results/Q-heterogeneity_steiger.tsv")
+
+```
+
+Heterogeneity statistics after Steiger-filtering:
+
+```{r Heterogeneity results}
+
+Qst <- Qst %>% 
+  select(outcome, exposure, method, Q, Q_df, Q_pval)
+
+kable(Qst)
+
+```
+
+## Main analyses in GSMR
+
+Now, I repeat the analyses in GSMR, which is part of the GCTA software package from the Yang Lab. I used default parameters except for the minimum number of instruments, which is set at 1 for these preliminary analyses. I used the original method for HEIDI outlier filtering (the updated one has not officially been released yet). 
+
+
+```{r GSMR prepare data, eval=F}
+
+# select dataframes with ncase.outcome ncontrol.outcome for binary traits
+
+gsmr_a <- MDD_outcome %>%
+  keep( ~ all(!is.na(.x$ncase.outcome)))
+
+# extract and rename right columns
+gsmr_a <- gsmr_a %>% 
+  purrr::imap(~ dplyr::
+                mutate(., bzy_n=sum(max(ncase.outcome), max(ncontrol.outcome))) %>% 
+                mutate(., bzx_n=sum(max(ncase.exposure), max(ncontrol.exposure))) %>% 
+                select(., outcome, SNP, effect_allele.exposure, other_allele.exposure, beta.exposure, beta.outcome, eaf.exposure, se.outcome, pval.outcome, se.exposure, pval.exposure, bzy_n, bzx_n) %>% 
+                rename(., bzx = beta.exposure) %>%
+                rename(., bzx_se = se.exposure) %>%
+                rename(., bzx_pval = pval.exposure) %>%
+                rename(., bzy = beta.outcome) %>%
+                rename(., bzy_se = se.outcome) %>%
+                rename(., bzy_pval = pval.outcome) %>%
+                rename(., a1 = effect_allele.exposure) %>%
+                rename(., a2 = other_allele.exposure) %>%
+                rename(., a1_freq = eaf.exposure))
+
+a_names <- list()
+for (i in 1:length(gsmr_a)){
+  a_names[i] <- gsmr_a[[i]]$outcome[1]
+}
+
+names(gsmr_a) <- a_names
+
+# Extract dataframes without separate case-control N for the outcome
+
+gsmr_b <- MDD_outcome %>%
+  keep( ~ all(is.na(.x$ncase.outcome)))
+
+# extract and rename right columns
+gsmr_b <-gsmr_b %>% 
+  purrr::imap(~ dplyr::
+                select(.,outcome, SNP, effect_allele.exposure, other_allele.exposure, beta.exposure, beta.outcome, eaf.exposure, se.outcome, pval.outcome, se.exposure, pval.exposure, samplesize.outcome, samplesize.outcome) %>% 
+                rename(., bzx = beta.exposure) %>%
+                rename(., bzx_se = se.exposure) %>%
+                rename(., bzx_pval = pval.exposure) %>%
+                rename(., bzy = beta.outcome) %>%
+                rename(., bzy_se = se.outcome) %>%
+                rename(., bzy_pval = pval.outcome) %>%
+                rename(., a1 = effect_allele.exposure) %>%
+                rename(., a2 = other_allele.exposure) %>%
+                rename(., a1_freq = eaf.exposure) %>% 
+                rename(., bzy_n = samplesize.outcome))
+
+b_names <- list()
+for (i in 1:length(gsmr_b)){
+  b_names[i] <- gsmr_b[[i]]$outcome[1]
+}
+
+names(gsmr_b) <- b_names
+
+# Write files with SNP and effect allele
+
+alleles_a <- gsmr_a %>% 
+  purrr::imap(~ dplyr::
+                select(., SNP, a1))
+                
+alleles_b <- gsmr_b %>% 
+  purrr::imap(~ dplyr::
+                select(., SNP, a1))
+
+for (i in 1:length(alleles_a)) {
+  fwrite(data.frame(alleles_a[i]), file=paste0("sumstats/gsmr/", names(alleles_a)[i], ".allele"), sep=" ")
+}
+
+for (i in 1:length(alleles_b)) {
+  fwrite(data.frame(alleles_b[i]), file=paste0("sumstats/gsmr/", names(alleles_b)[i], ".allele"), sep=" ")
+}
+
+```
+
+Move to linux machine to run GCTA.
+
+```{bash GSMR update alleles, eval=F}
+
+# copied all .allele files 
+# copied reference data from MAGMA 
+
+#!/bin/bash
+#SBATCH --job-name=updatealleles
+#SBATCH -A sens2017552
+#SBATCH -n 3
+#SBATCH -t 1:00:00
+#SBATCH --array=1-89
+
+file=$(ls *.allele | sed -n ${SLURM_ARRAY_TASK_ID}p)
+
+singularity exec --home $PWD $SIF/gwas.sif gcta64 \
+ --bfile g1000_eur \
+ --extract ${file} \
+ --update-ref-allele ${file} \
+ --recode \
+ --out g1000_${file} \
+ --thread-num 30
+
+grep -l "error" *allele.log | wc -l
+ls -l *xmat.gz | wc -l 
+
+
+```
+
+```{r GSMR analysis, eval=F}
+# Estimate LD correlation matrix using R
+
+# Read in the updated allele files
+files <- list.files(path="sumstats/gsmr/", pattern=glob2rx("*xmat.gz"), full.names = T)
+
+snp_coeff_id <- list()
+for (f in 1:length(files)) {
+  snp_coeff_id[[f]] <- scan(files[f], what="", nlines=1)
+}
+
+snp_coeff <- list()
+for (f in 1:length(files)) {
+  snp_coeff[[f]] <- read.table(files[f], header=F, skip=2)
+}
+
+# Make sure the gsmr dataframes are in the same order as snp_coeff_id
+gsmr <- append(gsmr_a, gsmr_b)
+gsmr <- gsmr[order(names(gsmr))]
+
+# Update the snp IDs
+snp_id <- list()
+snp_order <- list()
+
+for (i in 1:length(gsmr)) {
+  snp_id[[i]] = Reduce(intersect, list(gsmr[[i]]$SNP, snp_coeff_id[[i]]))
+  gsmr[[i]] <- gsmr[[i]][match(snp_id[[i]], gsmr[[i]]$SNP),]
+  snp_order[[i]] = match(snp_id[[i]], snp_coeff_id[[i]])
+  snp_coeff_id[[i]] = snp_coeff_id[[i]][snp_order[[i]]]
+  snp_coeff[[i]] = snp_coeff[[i]][, snp_order[[i]]]
+}
+  
+# Calculate the LD correlation matrix
+ldrho <- list()
+for (i in 1:length(snp_coeff)) {
+  ldrho[[i]] = cor(snp_coeff[[i]])
+}
+
+# Set the names for the ld matrix
+for (i in 1:length(ldrho)) {
+  colnames(ldrho[[i]]) = rownames(ldrho[[i]]) = snp_coeff_id[[i]]
+}
+
+# Set the parameters
+n_ref = 503    # Sample size of the reference sample (g1000 from the MAGMA reference files in the COMORMENT containers)
+gwas_thresh = 1    # GWAS threshold to select SNPs as the instruments for the GSMR analysis (I put this at 1 so that it includes the same snps as we use for the other MR analyses)
+single_snp_heidi_thresh = 0.01    # p-value threshold for single-SNP-based HEIDI-outlier analysis
+multi_snp_heidi_thresh = 0.01    # p-value threshold for multi-SNP-based HEIDI-outlier analysis
+nsnps_thresh = 1   # the minimum number of instruments required for the GSMR analysis (increase to 5 if possible)
+heidi_outlier_flag = TRUE    # flag for HEIDI-outlier analysis
+ld_r2_thresh = 1    # LD r2 threshold to remove SNPs in high LD (already done)
+ld_fdr_thresh = 0.05   # FDR threshold to remove the chance correlations between the SNP instruments
+gsmr2_beta = 0     # 0 - the original HEIDI-outlier method; 1 - the new HEIDI-outlier method that is currently under development 
+
+# Perform the gsmr analyses
+
+gsmr_results <- list()
+for (i in 1:length(gsmr)) {
+  gsmr_results[[i]] = gsmr(
+    gsmr[[i]]$bzx, 
+    gsmr[[i]]$bzx_se, 
+    gsmr[[i]]$bzx_pval, 
+    gsmr[[i]]$bzy, 
+    gsmr[[i]]$bzy_se, 
+    gsmr[[i]]$bzy_pval, 
+    ldrho[[i]], 
+    snp_coeff_id[[i]], 
+    n_ref, heidi_outlier_flag, gwas_thresh, single_snp_heidi_thresh, multi_snp_heidi_thresh, nsnps_thresh, ld_r2_thresh, ld_fdr_thresh, gsmr2_beta)    
+}
+
+# Extract the results
+
+n_instruments <- list()
+for (m in 1:length(gsmr_results)) {
+  n_instruments[[m]] <- length(gsmr_results[[m]]$used_index)
+}
+
+for (m in 1:length(n_instruments)) {
+  n_instruments[[m]] <- data.frame(n_instruments[[m]])
+}
+
+gsmr_results_ex <- list()
+for (m in 1:length(gsmr_results)) {
+    gsmr_results_ex[[m]] <- gsmr_results[[m]][c(1:3)]
+}
+
+gsmr_results_df <- list()
+for (i in 1:length(gsmr_results_ex)) {
+  gsmr_results_df[[i]] <- data.frame(gsmr_results_ex[[i]])
+}
+
+names(gsmr_results_df) <- names(gsmr)
+names(n_instruments) <- names(gsmr)
+
+gsmr_results_df <- rbindlist(gsmr_results_df, idcol = T) %>% 
+  setnames(c("outcome", "beta", "se", "p"))
+
+n_instruments <- rbindlist(n_instruments, idcol = T) %>% 
+  setnames(c("outcome", "Nsnps"))
+
+gsmr_results_df <- gsmr_results_df %>% 
+  full_join(n_instruments)
+
+kable(gsmr_results_df)
+
+fwrite(gsmr_results_df, "results/GSMR_results.tsv")
+
+```
+
+GSMR-results visualized in a forest plot again: 
+
+```{r gsmr plot}
+
+gsmr_results_df <- fread("results/GSMR_results.tsv")
+gsmr_plot <- forestplot(gsmr_results_df, 
+           title="GSMR results",
+           name=outcome, 
+           estimate = beta, 
+           se=se, 
+           # colour = Exposure,
+           xlab="Beta",
+           ylab="Outcome"
+           )
+
+ggsave("results/mainresults_gsmr.svg", gsmr_plot, device = "svg", width = 25, height = 20, units = "cm")
+
+gsmr_plot
+
+```
+
+
+# MDD as outcome
+
+## Data preparation steps
+
+Now, we will reverse and assess the effect of the risk factors/ outcomes on MDD. First, we will extract the instrument SNPs. When a clumping p-value of <5e-08 resulted in less than 10 instrument SNPs, I increased p stepwise to 5e-05 until all exposures had at least 10 instruments. 
+
+```{r Create instruments 2, echo=F, results='hide'}
+
+
+rm(list=ls(all=TRUE)[sapply(mget(ls(all=TRUE)), class) == "list"])
+
+# Extract hits 
+
+files <- list.files(path="sumstats/tidygwas", pattern= glob2rx("*_tidy.tsv.gz"), full.names = T)
+sel <- traitsfortsmr %>% mutate(filename = paste0("sumstats/tidygwas/", shorttraitname, "_tidy.tsv.gz"))
+sel <- sel$filename
+fread(sel[[1]])
+
+for (f in sel) {
+  sumstats <- fread(f)
+  sumstats <- sumstats %>% 
+    rename(Exposure=OUTCOME, effect_allele=A1, other_allele=A2, beta=B, se=SE, pval=P, samplesize=N)
+  
+  if ("EAF" %in% colnames(sumstats)) {
+    sumstats <- sumstats %>% 
+      rename(eaf = EAF)
+  }
+  
+  hits <- subset(sumstats, as.numeric(pval)<1e-05)
+  hits <- hits %>% 
+    mutate_all(na_if,"")
+  
+  f <- gsub("sumstats/tidygwas/", "", f)
+  f <- gsub("_tidy.tsv.gz", "", f)
+  write.table(hits, file = paste0("sumstats/instruments/", f, "_hits.txt"), sep=" ", na = "NA", quote = F, row.names = F)
+  
+}
+
+# Read in and clump
+files <- list.files(path="sumstats/instruments/", pattern=glob2rx("*_hits.txt"), full.name=T)
+
+clump <- function(file) {
+  x <- read_exposure_data(file,
+                          ncase_col = "N_CAS",
+                          ncontrol_col = "N_CON",
+                          phenotype_col = "Exposure")
+  y <- clump_data(x, clump_p1=5e-08)
+  
+  if (nrow(y)>9)
+    {res <- y}
+  else
+    {res <- clump_data(x, clump_p1=5e-7)}
+  
+  if (nrow(res)<10)
+  {res <- clump_data(x, clump_p1=5e-6)}
+  
+  if (nrow(res)<10)
+  {res <- clump_data(x, clump_p1=5e-5)}
+  
+  if (nrow(res)<10)
+  {res <- clump_data(x, clump_p1=1e-5)}
+
+  tibble(res)
+}
+
+exp_dat <- list()
+for (i in 1:length(files)) {
+  exp_dat[[i]] <- clump(files[[i]])
+}
+
+saveRDS(exp_dat, "sumstats/instruments/exp_dat.rds")
+
+count <- list()
+for (i in 1:length(exp_dat)) {
+  count[[i]] <- exp_dat[[i]] %>% group_by(exposure) %>% 
+    summarise(IV_SNPs=n())
+}
+
+```
+
+These procedures resulted in the following numbers of instrument SNPs for each exposure:
+
+```{r Create instruments results 2}
+
+kable(rbindlist(count))
+
+```
+
+We look up the instrument SNPs in the MDD outcome data and harmonize alleles. 
+
+```{r Harmonize exposure-outcome data 2}
+
+# For each instrument - outcome combination, we look up the instrument SNPs in the outcome data.
+
+outcomedata <- list()
+for (i in 1:length(exp_dat)) {
+              outcomedata[[i]] <- read_outcome_data(
+                snps = exp_dat[[i]]$SNP,
+                filename = "sumstats/tidygwas/MDD_Als_looUKB_tidy.tsv.gz",
+                sep = "\t",
+                snp_col = "SNP",
+                beta_col = "B",
+                se_col = "SE",
+                effect_allele_col = "A1",
+                other_allele_col = "A2",
+                eaf_col = "EAF",
+                pval_col = "P", 
+                ncase="N_CAS",
+                ncontrol="N_CON",
+                samplesize_col="N", 
+                phenotype_col="OUTCOME",
+              )
+  }
+              
+saveRDS(outcomedata, "exposure-MDD_data.RDS")
+
+
+####
+# Harmonize
+
+exposure_MDD <- list()
+for (i in 1:length(outcomedata)) {
+  exposure_MDD[[i]] <- harmonise_data(
+    exposure_dat = exp_dat[[i]], 
+    outcome_dat = outcomedata[[i]]
+  )
+}
+
+# Keep only filtered SNPs
+for (i in 1:length(outcomedata)) {
+  exposure_MDD[[i]] <- subset(exposure_MDD[[i]], mr_keep==T)
+}
+
+# write harmonized files to tables for information on SNPs
+for (i in 1:length(exposure_MDD)) {
+  fwrite(exposure_MDD[[i]], paste0("sumstats/harmonized/", exposure_MDD[[i]]$exposure[[1]], "_to_MDD_harmonized.txt"))
+}
+
+saveRDS(exposure_MDD, "exposure-MDD_harmonized.RDS")
+
+
+```
+
+
+## Main analyses
+
+Next, we repeat the same steps as before when MDD was the exposure, starting with the main analysis and Steiger filtering.
+
+```{r Main analyses 2, echo=F, results='hide'}
+
+# Read in data 
+exposure_MDD <- readRDS("exposure-MDD_harmonized.RDS")
+
+mr_res <- exposure_MDD %>%
+  map(mr)
+
+# IVW results plot
+
+MRres_forplot <- rbindlist(mr_res) %>% 
+  filter(method=="Inverse variance weighted")
+
+MRres_plot <- forestplot(MRres_forplot, 
+           title="MR results (IVW) before Steiger filtering",
+           name=exposure, 
+           estimate = b, 
+           se=se, 
+           colour = outcome,
+           xlab="Beta",
+           ylab="Exposure"
+           )
+
+ggsave("results/MDD_as_outcome/exposure-MDD.svg",  MRres_plot, device = "svg", width = 20, height = 20, units = "cm")
+
+
+####
+# Steiger filter all analyses
+
+# Need some extra columns to determine R2 for binary traits
+for (i in 1:length(exposure_MDD)) {
+  cols <- names(exposure_MDD[[i]])
+  exposure_MDD[[i]] <- exposure_MDD[[i]] %>%
+    mutate(units.outcome="log_odds") %>%
+    mutate(prevalence.outcome=0.25) %>%
+    mutate(units.exposure=ifelse(!is.na(ncase.exposure) & !is.na(ncontrol.exposure), "log_odds", NA)) %>%
+    mutate(prevalence.exposure=ifelse(!is.na(ncase.exposure) & !is.na(ncontrol.exposure), ncase.exposure/samplesize.exposure, NA))
+}
+
+# Determine which SNPs explain more variance in the outcome
+exposure_MDD <- exposure_MDD %>% 
+  map(steiger_filtering)
+
+# Re-run while filtering out SNPs that are in the wrong direction and explain more variance in the outcome than in the exposure (dir=TRUE). Note I do not filter out based on p-value as this is too stringent.
+st_res <- list()
+for (i in 1:length(exposure_MDD)) {
+  st_res[[i]] <- mr(subset(exposure_MDD[[i]], !(exposure_MDD[[i]]$steiger_pval < 0.05 & exposure_MDD[[i]]$steiger_dir == FALSE)))
+}
+
+# Scatter plots after Steiger filtering 
+
+for (i in 1:length(st_res)) {
+  res1 <- st_res[[i]]
+  dat1 <- exposure_MDD[[i]]
+  name <- paste0("scatter_",res1[1,4],"_",res1[1,3],"_steiger")
+  p_save <- mr_scatter_plot(res1,dat1)[[1]] + 
+    theme_bw() + theme(legend.position = "top")
+  ggsave(plot = p_save, filename = paste0("results/plots/",name,".svg"))
+}
+
+# IVW results plots after Steiger filtering
+
+# st_res <- keep(st_res, ~ nrow(.) >0)
+
+MRst_forplot <- rbindlist(st_res) %>% 
+  filter(method=="Inverse variance weighted")
+
+MRst_plot <- forestplot(MRst_forplot, 
+           title="MR results (IVW) after Steiger filtering",
+           name=exposure, 
+           estimate = b, 
+           se=se, 
+           colour = outcome,
+           xlab="Beta",
+           ylab="Exposure"
+           )
+
+ggsave("results/MDD_as_outcome/mainresults_steiger.svg", MRst_plot, device = "svg", width = 25, height = 20, units = "cm")
+
+MRst_df <- rbindlist(st_res, use.names = T) %>% 
+  select(-id.exposure, -id.outcome)
+
+MRres <- rbindlist(mr_res, use.names = T) %>% 
+  select(-id.exposure, -id.outcome)
+
+fwrite(MRres, "results/MDD_as_outcome/mainresults.tsv")
+fwrite(MRst_df, "results/MDD_as_outcome/mainresults_steiger.tsv")
+saveRDS(exposure_MDD, "results/MDD_as_outcome/exposure-MDD_foranalysis.rds")
+saveRDS(mr_res, "results/MDD_as_outcome/mr_res.rds")
+saveRDS(st_res, "results/MDD_as_outcome/st_res.rds")
+
+```
+
+
+## Sensitivity analyses
+
+### Pleiotropy
+
+Again, we test pleiotropy.
+
+```{r Pleiotropy 2}
+
+# MR-Egger intercept 
+
+MEintercept <- list()
+for (i in 1:length(exposure_MDD)) {
+  res <- data.frame(mr_pleiotropy_test(exposure_MDD[[i]]))
+  MEintercept[[i]] <- res
+}
+
+MEintercept <- rbindlist(MEintercept)
+kable(MEintercept %>% 
+  select(exposure, outcome, egger_intercept, se, pval))
+
+fwrite(MEintercept, "results/MDD_as_outcome/MR-Egger_intercept.tsv")
+
+```
+
+We run MR-PRESSO to check outlier effects.
+
+```{r MR-PRESSO 2, eval=F}
+# Run on a cluster (if not already there)
+
+exposure_MDD <- readRDS("exposure-MDD_foranalysis.rds")
+
+presso <- function(x) {
+   res <- mr_presso(data=data.frame(x),
+                              BetaOutcome = "beta.outcome", 
+                              BetaExposure = "beta.exposure", 
+                              SdOutcome = "se.outcome", 
+                              SdExposure = "se.exposure", 
+                              OUTLIERtest = TRUE, DISTORTIONtest = TRUE,
+                              NbDistribution = 10000, 
+                              SignifThreshold = 0.05)
+}
+
+plan(multisession, workers = 30)
+
+exposure_MDD_s <- list()
+for (i in 1:length(exposure_MDD)) {
+  if (nrow(exposure_MDD[[i]]) > 9) {
+    exposure_MDD_s[[i]] <- exposure_MDD[[i]]
+  }
+}
+
+res <- future_map(compact(exposure_MDD_s), presso)
+
+saveRDS(res, "results/MDD_as_outcome/presso.rds")
+
+presso_res <- list()
+
+
+extractpresso <- function(x) {
+  
+  a <- x$`Main MR results`
+  
+  if ("Outlier Test" %in% names(x$`MR-PRESSO results`)) {
+    
+    b <- data.frame(nsnp = nrow(x$`MR-PRESSO results`$`Outlier Test`))
+    c <- cbind(a, b %>% slice(rep(1:n(), each = 2)))
+    
+  }
+  else {
+    
+    c <- cbind(a, data.frame(nsnp = NA) %>% slice(rep(1:n(), each = 2)))
+  
+    }
+  
+  c
+}
+
+presso_res <- map(res, extractpresso)
+
+exposure_name_vector <- vector()
+for (i in 1:length(compact(exposure_MDD_s))) {
+  exposure_name_vector[[i]] <- compact(exposure_MDD_s)[[i]]$exposure[[1]]
+}
+
+names(presso_res) <- exposure_name_vector
+
+presso_res <- rbindlist(presso_res, use.names=T, idcol = T) %>%
+  mutate(Outcome="MDD") %>% 
+  select(-Exposure) %>% 
+  rename(Exposure=.id) 
+
+fwrite(presso_res, "results/MDD_as_outcome/presso_res.tsv")
+
+``` 
+
+```{r MR presso results 2}
+
+presso_res <- fread("results/MDD_as_outcome/presso_res.tsv")
+
+presso_res %>% dplyr::mutate_if(is.numeric, funs(as.character(signif(., 3)))) %>%
+    kable(.)
+
+```
+
+
+### R-squared
+
+Next, we derive total instrument SNP R-squared, using the Steiger data wrangling steps.
+
+```{r R-squared 2}
+
+exposure_MDD <- readRDS("results/MDD_as_outcome/exposure-MDD_foranalysis.rds")
+
+# Extract list of R-squared for each dataframe
+r2 <- list()
+for (i in 1:length(exposure_MDD)) {
+  r2[[i]] <- tibble(exposure_MDD[[i]]$exposure[[1]], sum(exposure_MDD[[i]]$rsq.exposure))
+}
+
+res_r2 <- (rbindlist(r2))
+colnames(res_r2) <- c("exposure", "Rsq")
+kable(res_r2)
+
+fwrite(res_r2, "results/MDD_as_outcome/instrumentR2.tsv")
+```
+
+We derive I-squared to assess if we can interpret MR-Egger or it needs correction, as well as the F statistic to assess instrument strength.
+
+```{r Isq and F statistic 2}
+
+exposure_MDD_f <- list()
+for (i in 1:length(exposure_MDD)) {
+  exposure_MDD_f[[i]] <- appendIsq(exposure_MDD[[i]])
+}
+
+isqs <- list()
+for (i in 1:length(exposure_MDD_f)) {
+  isqs[[i]] <- exposure_MDD_f[[i]] %>%
+      group_by(exposure, outcome) %>% 
+      summarise(Isq_max=max(Isq_max), mean_Fstatistic=max(mFstatistic), Isq_weight=first(Isq_max_weighted)) %>% 
+      mutate(SIMEX=ifelse(Isq_max>0.6 & Isq_max<0.9, "SIMEX_egger", NA)) %>% 
+      mutate(SIMEX=ifelse(Isq_max>0.9, "Standard_egger", SIMEX)) %>%
+      mutate(SIMEX=ifelse(Isq_max<0.6, "No_egger", SIMEX)) %>% 
+      mutate(Instrument_strength=ifelse(mean_Fstatistic<10, "weak", "sufficient"))
+}
+
+isqs <- rbindlist(isqs)
+
+kable(isqs)
+
+saveRDS(exposure_MDD_f, "exposure_MDD_f.rds")
+fwrite(isqs, "results/MDD_as_outcome/Isquared_F.tsv")
+
+```
+
+### SIMEX-correction for MR-Egger
+
+The SIMEX correction takes long to run (at least when specifying B=10000), so run this on vector and only re-run when absolutely necessary. 
+
+```{r SIMEX 2, eval=F}
+
+
+simex_res <- exposure_MDD_f %>%
+  map(simexfunction)
+
+exposure_name_vector <- vector()
+for (i in 1:length(exposure_MDD_f)) {
+  exposure_name_vector[[i]] <- exposure_MDD_f[[i]]$exposure[[1]]
+}
+
+names(simex_res) <- exposure_name_vector
+
+unnested <- compact(simex_res)
+for (i in 1:length(unnested)) {
+  unnested[[i]] <- data.frame(unnested[[i]]$jackknife)
+  unnested[[i]] <- unnested[[i]]["exposure",]
+  colnames(unnested[[i]]) <- c("simex_estimate", "simex_SE", "simex_t-value", "simex_p-value")
+}
+
+unnested <- rbindlist(unnested, use.names = T, id=T)
+unnested <- unnested %>% rename(exposure=.id)
+
+simex_results <- full_join(isqs, unnested)
+fwrite(simex_results, "results/MDD_as_outcome/simex_corrected.tsv")
+
+```
+
+These are the results for the SIMEX-corrected MR-Egger estimates: 
+
+```{r simex results 2}
+
+simex_results <- fread("results/MDD_as_outcome/simex_corrected.tsv")
+kable(simex_results)
+
+```
+
+
+### Heterogeneity 
+
+Cochran's Q, leave-one-out analysis, and single-snp analysis. 
+
+```{r Heterogeneity analyses 2, echo=F, results='hide'}
+
+for (i in 1:length(exposure_MDD)) {
+  loores <- data.frame(mr_leaveoneout(exposure_MDD[[i]]))
+  name <- paste0("loo_",loores[[c(1, 1)]],"_",loores[[c(2, 1)]][1])
+  p_save <- mr_leaveoneout_plot(loores)[[1]] 
+  ggsave(plot = p_save, filename = paste0("results/plots/",name,".svg"))
+}
+
+
+# Single SNP analysis
+
+for (i in 1:length(exposure_MDD)) {
+  singleres <- data.frame(mr_singlesnp(exposure_MDD[[i]]))
+  name <- paste0("funnel_",singleres[[c(1, 1)]],"_",singleres[[c(2, 1)]][1])
+  p_save <- mr_funnel_plot(singleres)[[1]] 
+  ggsave(plot = p_save, filename = paste0("results/plots/",name,".svg"))
+}
+
+# cochran's Q
+
+Q <- list()
+for (i in 1:length(exposure_MDD)) {
+  Qres <- data.frame(mr_heterogeneity(exposure_MDD[[i]]))
+  Q[[i]] <- Qres
+}
+
+Qst <- list()
+for (i in 1:length(exposure_MDD)) {
+  Qstres <- data.frame(mr_heterogeneity(subset(exposure_MDD[[i]], !(exposure_MDD[[i]]$steiger_pval < 0.05 & exposure_MDD[[i]]$steiger_dir == FALSE))))
+  Qst[[i]] <- Qstres
+}
+
+Q <- rbindlist(Q) 
+Qst <- rbindlist(Qst)
+
+fwrite(Q, "results/MDD_as_outcome/Q-heterogeneity.tsv")
+fwrite(Qst, "results/MDD_as_outcome/Q-heterogeneity_steiger.tsv")
+
+```
+
+
+Heterogeneity statistics after Steiger-filtering:
+
+```{r Heterogeneity results 2}
+
+Qst <- Qst %>% 
+  select(outcome, exposure, method, Q, Q_df, Q_pval)
+
+kable(Qst)
+
+```
+
+
+## Main analyses in GSMR
+
+Repeat analysis in GSMR.
+
+
+```{r GSMR prepare data 2, eval=F}
+# select dataframes with ncase.outcome ncontrol.outcome
+# exposure_MDD <- readRDS("exposure-MDD_harmonized.RDS")
+gsmr_a <- exposure_MDD %>%
+  keep( ~ all(!is.na(.x$ncase.exposure)))
+
+# extract and rename right columns
+gsmr_a <-gsmr_a %>% 
+  purrr::imap(~ dplyr::
+                mutate(., bzy_n=sum(max(ncase.outcome), max(ncontrol.outcome))) %>% 
+                mutate(., bzx_n=sum(max(ncase.exposure), max(ncontrol.exposure))) %>% 
+                select(., exposure, SNP, effect_allele.exposure, other_allele.exposure, beta.exposure, beta.outcome, eaf.exposure, se.outcome, pval.outcome, se.exposure, pval.exposure, bzy_n, bzx_n) %>% 
+                rename(., bzx = beta.exposure) %>%
+                rename(., bzx_se = se.exposure) %>%
+                rename(., bzx_pval = pval.exposure) %>%
+                rename(., bzy = beta.outcome) %>%
+                rename(., bzy_se = se.outcome) %>%
+                rename(., bzy_pval = pval.outcome) %>%
+                rename(., a1 = effect_allele.exposure) %>%
+                rename(., a2 = other_allele.exposure) %>%
+                rename(., a1_freq = eaf.exposure))
+
+a_names <- list()
+for (i in 1:length(gsmr_a)){
+  a_names[i] <- gsmr_a[[i]]$exposure[1]
+}
+
+names(gsmr_a) <- a_names
+
+# Extract dataframes without separate case-control N for the outcome
+
+gsmr_b <- exposure_MDD %>%
+  keep( ~ all(is.na(.x$ncase.exposure)))
+
+# extract and rename right columns
+gsmr_b <-gsmr_b %>% 
+  purrr::imap(~ dplyr::
+                select(.,exposure, SNP, effect_allele.exposure, other_allele.exposure, beta.exposure, beta.outcome, eaf.exposure, se.outcome, pval.outcome, se.exposure, pval.exposure, samplesize.outcome, samplesize.outcome) %>% 
+                rename(., bzx = beta.exposure) %>%
+                rename(., bzx_se = se.exposure) %>%
+                rename(., bzx_pval = pval.exposure) %>%
+                rename(., bzy = beta.outcome) %>%
+                rename(., bzy_se = se.outcome) %>%
+                rename(., bzy_pval = pval.outcome) %>%
+                rename(., a1 = effect_allele.exposure) %>%
+                rename(., a2 = other_allele.exposure) %>%
+                rename(., a1_freq = eaf.exposure) %>% 
+                rename(., bzy_n = samplesize.outcome))
+
+b_names <- list()
+for (i in 1:length(gsmr_b)){
+  b_names[i] <- gsmr_b[[i]]$exposure[1]
+}
+
+names(gsmr_b) <- b_names
+
+# Write files with SNP and effect allele
+
+alleles_a <- gsmr_a %>% 
+  purrr::imap(~ dplyr::
+                select(., SNP, a1))
+                
+alleles_b <- gsmr_b %>% 
+  purrr::imap(~ dplyr::
+                select(., SNP, a1))
+
+for (i in 1:length(alleles_a)) {
+  fwrite(data.frame(alleles_a[i]), file=paste0("sumstats/gsmr/MDD_as_outcome/", names(alleles_a)[i], ".allele"), sep=" ")
+}
+
+for (i in 1:length(alleles_b)) {
+  fwrite(data.frame(alleles_b[i]), file=paste0("sumstats/gsmr/MDD_as_outcome/", names(alleles_b)[i], ".allele"), sep=" ")
+}
+
+```
+
+
+```{bash GSMR update alleles 2, eval=F}
+
+#!/bin/bash
+#SBATCH --job-name=updatealleles
+#SBATCH -A sens2017599
+#SBATCH -p node
+#SBATCH -t 1:00:00
+#SBATCH --array=1-89
+
+file=$(ls *.allele | sed -n ${SLURM_ARRAY_TASK_ID}p)
+
+for i in *allele 
+do 
+singularity exec --home $PWD $SIF/gwas.sif gcta64 \
+--bfile g1000_eur \
+--extract $i \
+--update-ref-allele $i \
+--recode \
+--out 1kG.EUR.rsonly_$i
+done
+
+grep -l "error" *allele.log | wc -l
+ls -l *xmat.gz | wc -l 
+
+
+```
+
+```{r GSMR analysis 2, eval=F}
+
+# Estimate LD correlation matrix using R
+
+# Read in the updated allele files
+files <- list.files(path="sumstats/gsmr/MDD_as_outcome/", pattern=glob2rx("*xmat.gz"), full.names = T)
+
+snp_coeff_id <- list()
+for (f in 1:length(files)) {
+  snp_coeff_id[[f]] <- scan(files[f], what="", nlines=1)
+}
+
+snp_coeff <- list()
+for (f in 1:length(files)) {
+  snp_coeff[[f]] <- read.table(files[f], header=F, skip=2)
+}
+
+# Make sure the gsmr dataframes are in the same order as snp_coeff_id
+gsmr <- append(gsmr_a, gsmr_b)
+gsmr <- gsmr[order(names(gsmr))]
+
+for (i in 1:length(gsmr)) {
+  if (nrow(gsmr[[i]]) < 1) {
+    gsmr[[i]] <- NULL
+  }
+}
+
+# Update the snp IDs
+snp_id <- list()
+snp_order <- list()
+
+for (i in 1:length(gsmr)) {
+  snp_id[[i]] = Reduce(intersect, list(gsmr[[i]]$SNP, snp_coeff_id[[i]]))
+  gsmr[[i]] <- gsmr[[i]][match(snp_id[[i]], gsmr[[i]]$SNP),]
+  snp_order[[i]] = match(snp_id[[i]], snp_coeff_id[[i]])
+  snp_coeff_id[[i]] = snp_coeff_id[[i]][snp_order[[i]]]
+  snp_coeff[[i]] = snp_coeff[[i]][, snp_order[[i]]]
+}
+  
+# Calculate the LD correlation matrix
+ldrho <- list()
+for (i in 1:length(snp_coeff)) {
+  ldrho[[i]] = cor(snp_coeff[[i]])
+}
+
+# Set the names for the ld matrix
+for (i in 1:length(ldrho)) {
+  colnames(ldrho[[i]]) = rownames(ldrho[[i]]) = snp_coeff_id[[i]]
+}
+
+# Set the parameters
+n_ref = 503    # Sample size of the reference sample (g1000 from the MAGMA reference files in the COMORMENT containers)
+gwas_thresh = 1    # GWAS threshold to select SNPs as the instruments for the GSMR analysis (I put this at 1 so that it includes the same snps as we use for the other MR analyses)
+single_snp_heidi_thresh = 0.01    # p-value threshold for single-SNP-based HEIDI-outlier analysis
+multi_snp_heidi_thresh = 0.01    # p-value threshold for multi-SNP-based HEIDI-outlier analysis
+nsnps_thresh = 1   # the minimum number of instruments required for the GSMR analysis (increase to 5 if possible)
+heidi_outlier_flag = TRUE    # flag for HEIDI-outlier analysis
+ld_r2_thresh = 1    # LD r2 threshold to remove SNPs in high LD (already done)
+ld_fdr_thresh = 0.05   # FDR threshold to remove the chance correlations between the SNP instruments
+gsmr2_beta = 0     # 0 - the original HEIDI-outlier method; 1 - the new HEIDI-outlier method that is currently under development 
+
+# Perform the gsmr analyses
+# Define array of elements with enough SNPs
+
+array <- list()
+for (i in 1:length(gsmr)) {
+  if(nrow(gsmr[[i]]) > 1) {
+    array[i] <- tibble(i)
+  }
+}
+
+gsmr_results <- list()
+for (i in compact(array)) {
+  gsmr_results[[i]] <- {
+    gsmr(
+      gsmr[[i]]$bzx, 
+      gsmr[[i]]$bzx_se, 
+      gsmr[[i]]$bzx_pval, 
+      gsmr[[i]]$bzy, 
+      gsmr[[i]]$bzy_se, 
+      gsmr[[i]]$bzy_pval, 
+      ldrho[[i]], 
+      snp_coeff_id[[i]], 
+      n_ref, heidi_outlier_flag, gwas_thresh, single_snp_heidi_thresh, multi_snp_heidi_thresh, nsnps_thresh, ld_r2_thresh, ld_fdr_thresh, gsmr2_beta) 
+  }
+}
+
+# Extract the results
+
+
+n_instruments <- list()
+for (m in 1:length(gsmr_results)) {
+  n_instruments[[m]] <- length(gsmr_results[[m]]$used_index)
+}
+
+for (m in 1:length(n_instruments)) {
+  n_instruments[[m]] <- data.frame(n_instruments[[m]])
+}
+
+gsmr_results_ex <- list()
+for (m in 1:length(gsmr_results)) {
+    gsmr_results_ex[[m]] <- gsmr_results[[m]][c(1:3)]
+}
+
+gsmr_results_df <- list()
+for (i in 1:length(gsmr_results_ex)) {
+  gsmr_results_df[[i]] <- data.frame(gsmr_results_ex[[i]])
+}
+
+names <- list()
+for (i in 1:length(array)) {
+    names[[i]] <- gsmr[[i]][1,1]
+  }
+
+
+names(gsmr_results_df) <- as.character(names)
+names(n_instruments) <- as.character(names)
+
+gsmr_results_df <- rbindlist(gsmr_results_df, idcol = T) %>% 
+  setnames(c("exposure", "beta", "se", "p"))
+
+n_instruments <- rbindlist(n_instruments, idcol = T) %>% 
+  setnames(c("exposure", "Nsnps"))
+
+gsmr_results_df <- gsmr_results_df %>% 
+  full_join(n_instruments) %>% 
+  filter(!is.na(exposure))
+
+kable(gsmr_results_df)
+
+fwrite(gsmr_results_df, "results/MDD_as_outcome/GSMR_results.tsv")
+
+```
+
+

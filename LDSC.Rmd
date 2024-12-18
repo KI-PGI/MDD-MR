@@ -1,0 +1,468 @@
+---
+title: "LDSC MDD-MR traits"
+output: html_document
+---
+
+```{r setup, include=FALSE, eval=TRUE}
+
+library(tidyverse)
+library(data.table)
+library(GenomicSEM)
+library(knitr)
+library(rstatix)
+library(R.utils)
+library(readxl)
+library(ggnewscale)
+library(scales)
+library(patchwork)
+library(ggforce)
+library(paletteer)
+library(gridExtra)
+library(writexl)
+
+
+knitr::opts_knit$set(root.dir = "")
+
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE, error=FALSE)
+
+
+```
+
+Summary statistics were curated using tidyGWAS, https://github.com/Ararder/tidyGWAS. 
+
+```{r Prep for ldsc analysis}
+
+files <- list.files(path = "sumstats/formatted/", pattern = glob2rx("*_formatted*"))
+
+formatagain <- function(x) {
+  print(paste0("processing ", x))
+  
+  sumstats <- fread(paste0("sumstats/formatted/", x)) 
+
+  colnames(sumstats) <- toupper(colnames(sumstats))
+  
+  if (all(c("N", "EAF") %in% colnames(sumstats))) {
+    sumstats <- sumstats %>% select(OUTCOME, SNP, CHR, BP, A1, A2, EAF, B, SE, P, N, N_CAS, N_CON)
+  } else if("N" %in% colnames(sumstats)) {
+    sumstats <- sumstats %>% select(OUTCOME, SNP, CHR, BP, A1, A2, B, SE, P, N, N_CAS, N_CON)
+  } else if (!"N" %in% colnames(sumstats)) {
+    sumstats <- sumstats %>% mutate(N = sum(N_CAS, N_CON))
+  }
+  
+  if(nrow(sumstats) < 200000) {
+    print(c(sumstats$OUTCOME[1], "too few SNPs"))
+    fwrite(sumstats, paste0("sumstats/formatted/toofewsnps/", x), sep="\t", na=NA, quote=F)
+    unlink(paste0("sumstats/formatted/", x))
+  } else {
+  fwrite(sumstats, paste0("sumstats/formatted/", x), sep="\t", na=NA, quote=F)
+  }
+  
+}
+
+map(files, formatagain)
+
+# Determine input parameters for the munge and rg
+
+getvarinfo <- function(file) {
+  
+  x <- fread(paste0("sumstats/formatted/", file))
+  
+  print(x$OUTCOME[1])
+  
+  cols <- names(x)
+
+  cont <- if (all(is.na(x$N_CAS)) | !"N_CAS" %in% cols) {
+      data.frame(trait = x$OUTCOME[1], level = "continuous")
+    } else {
+      data.frame(trait = x$OUTCOME[1], level = "binary")
+    }
+  
+  N <- data.frame(N = x$N[1])
+  
+  prev <- if (all(is.na(x[["N_CAS"]])) | !"N_CAS" %in% colnames(x)) {
+      data.frame(prev = NA)  
+    } else {
+      data.frame(prev = max(x$N_CAS)/max((x$N_CAS + x$N_CON)))
+    }
+  
+  cbind(cont, N, prev)
+  
+}
+
+files <- list.files(path = "sumstats/formatted/", pattern = glob2rx("*_formatted*"))
+
+varinfo <- list()
+varinfo <- map(files, getvarinfo)
+varinfo_unlisted <- rbindlist(varinfo)
+
+fwrite(varinfo_unlisted, "sumstats/variables_info.txt")
+
+```
+
+Munge the summary statistics.
+
+``` {r Munge, results='hide'}
+# Munge sumstats
+
+hm3 <- "sumstats/eur_w_ld_chr/w_hm3.snplist"
+files <- list.files(path = "sumstats/formatted", pattern = glob2rx("*_formatted*"), full.names = T) 
+traits <- list.files(path = "sumstats/formatted/", pattern = glob2rx("*_formatted*")) 
+traits <- gsub("_formatted.txt.gz", "", files)
+traits <- gsub("sumstats/formatted/", "", traits)
+
+
+munge(files=files,
+      hm3=hm3,
+      trait.names=traits,
+      maf.filter=0.01)
+
+# move to munged sub folder
+oldnames <- list.files(path = ".", pattern = glob2rx("*.sumstats.gz")) 
+newnames <- paste0("sumstats/munged/", oldnames)
+file.rename(oldnames, newnames)
+
+```
+Compute genetic correlations between all traits.
+
+``` {r rg, results='hide'}
+
+varcategories <- read_excel("trait_selection/TraitSelection.xlsx", na=c("", NA)) %>% 
+  select(shorttraitname, Category)
+
+
+# Compute genetic correlations using genomic SEM
+
+varinfo <- fread("sumstats/variables_info.txt") %>% 
+  mutate(file = paste0("sumstats/munged/", trait, ".sumstats.gz")) %>% 
+  left_join(varcategories, by = c("trait" = "shorttraitname")) %>% 
+  arrange(Category, trait) 
+
+categories <- varinfo %>% 
+  group_by(Category) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  select(Category) %>% 
+  filter(!is.na(Category))
+categories <- categories$Category
+  
+ld <-"sumstats/eur_w_ld_chr"
+wld <- "sumstats/eur_w_ld_chr"
+
+
+rg_percategory <- function(cat) {
+  
+  traits <- varinfo %>% filter(Category == cat | Category == "MDD") %>% select(file)
+  traits <- traits$file
+  
+  sample.prev <- varinfo %>% filter(Category == cat | Category == "MDD") %>% select(prev)
+  sample.prev <- sample.prev$prev
+  
+  population.prev <- varinfo %>% filter(Category == cat | Category == "MDD") %>% select(prev) # just set at sample prev, since it's only used for h2, not for rg
+  population.prev <- population.prev$prev
+  
+  trait.names <- varinfo %>% filter(Category == cat | Category == "MDD") %>% select(trait)
+  trait.names <- trait.names$trait
+  
+  LDSCoutput <- ldsc(traits, 
+                   sample.prev, 
+                   population.prev, 
+                   ld, 
+                   wld, 
+                   trait.names,
+                   ldsc.log = paste0("results/ldsc/ldsclog_", cat))
+  
+  LDSCoutput
+}
+
+LDSCoutput_full<- map(categories, rg_percategory)
+
+for (i in 1:length(LDSCoutput_full)) {
+  saveRDS(LDSCoutput_full[[i]], file=paste0("results/ldsc/LDSCoutput_", categories[i], ".RDS"))
+}
+
+```
+
+Extract the genetic correlations for all traits from the ldsc output.
+
+``` {r wrangle data, results='hide'}
+
+
+transformtocor <- function(i) {
+  
+    ldscoutput <- readRDS(paste0("results/ldsc/LDSCoutput_", i, ".RDS"))
+    k <- nrow(ldscoutput$S)
+    gencor <- matrix(0,k,k)
+    gencor <- cov2cor(ldscoutput$S)
+    rownames(gencor) <- colnames(gencor)
+    gencor
+}
+
+gencor <- list()
+
+for (i in categories) {
+  gencor[[i]] <- transformtocor(i) 
+}
+
+names(gencor) <- categories
+
+# compute SE 
+
+
+compute_SE_of_rg <- function(gsem_obj) {
+  
+  S <- gsem_obj$S
+  V <- gsem_obj$V
+  
+  
+  ratio <- tcrossprod(1 / sqrt(diag(S)))
+  S_Stand <- S * ratio
+  
+  scaleO <- gdata::lowerTriangle(ratio, diag = TRUE)
+  
+  
+  #rescale the sampling correlation matrix by the appropriate diagonals
+  V_Stand <- V * tcrossprod(scaleO)
+  
+  #enter SEs from diagonal of standardized V
+  r <- nrow(S)
+  SE_Stand <- matrix(0, r, r)
+  SE_Stand[lower.tri(SE_Stand, diag = TRUE)] <- sqrt(diag(V_Stand))
+  as.data.frame(as.matrix(Matrix::forceSymmetric(SE_Stand, "L")))
+  
+  
+}
+
+ldscoutput <- list()
+se <- list()
+
+for (i in categories) {
+  ldscoutput[[i]] <- readRDS(paste0("results/ldsc/LDSCoutput_", i, ".RDS"))
+  se[[i]] <- compute_SE_of_rg(ldscoutput[[i]]) 
+  colnames(se[[i]]) <- colnames(gencor[[i]])
+  rownames(se[[i]]) <- rownames(gencor[[i]])
+}
+
+
+# Merge
+
+gatherresults <- function(i) {
+  
+  gencor_gathered <- cor_gather(gencor[[i]])
+  se_gathered <- cor_gather(se[[i]]) %>% 
+    rename(SE = cor) 
+  gathered <- gencor_gathered %>% 
+    inner_join(se_gathered) 
+  
+  gathered
+}
+
+gatheredresults <- list()
+
+for (i in categories) {
+  gatheredresults[[i]] <- gatherresults(i)
+}
+
+gatheredresults <- rbindlist(gatheredresults, use.names = T, idcol = "Category") 
+
+gatheredresults <- gatheredresults %>% 
+  mutate(P = 2*pnorm(-abs(cor/SE), mean = 0, sd = 1, lower.tail = TRUE))
+
+gatheredresults
+
+fwrite(gatheredresults, "results/ldsc/rg_results.tsv")
+
+```
+
+Extract the SNP heritability estimates from the log file.
+
+```{r h2}
+
+extracth2 <- function(logfile) {
+  completelog <- readLines(logfile) 
+    
+    binarytraits <- completelog[grep(
+    "Liability scale results for*", completelog)]
+  binarytraits <- gsub("Liability scale results for: ", "", binarytraits)
+  
+  binaryres <- completelog[grep(
+    "Total Liability Scale h2*", completelog)]
+  binaryres <- gsub("Total Liability Scale h2: ", "", binaryres)
+  
+  binary <- cbind(binarytraits, binaryres)
+  
+  binary <- data.frame(binary) %>% 
+    separate(binaryres, c("liability_h2", "liability_SE"), sep = "\\(") %>% 
+    mutate(liability_SE = gsub("\\)", "", liability_SE)) %>% 
+    rename(trait = "binarytraits") 
+  
+  continuoustraits <- completelog[grep(
+    "Estimating heritability*", completelog)]
+  continuoustraits <- gsub(".*munged/", "", continuoustraits)
+  continuoustraits <- gsub(".sumstats.gz", "", continuoustraits)
+  
+  continuousres <- completelog[grep(
+    "Total Observed Scale h2: ", completelog)]
+  continuousres <- gsub("Total Observed Scale h2: ", "", continuousres)
+    
+  continuous <- cbind(continuoustraits, continuousres)
+  
+  continuous <- data.frame(continuous) %>% 
+    separate(continuousres, c("scale_h2", "scale_SE"), sep = "\\(") %>% 
+    mutate(scale_SE = gsub("\\)", "", scale_SE)) %>% 
+    rename(trait = "continuoustraits") 
+  
+  binary %>% 
+    full_join(continuous)
+}
+
+logfiles <- list.files(path = "results/ldsc", pattern = "*.log", full.names = T)
+
+h2 <- map(logfiles, extracth2)
+
+h2 <- rbindlist(h2) %>% 
+  group_by(trait) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  mutate(liability_h2 = as.numeric(liability_h2),
+         scale_h2 = as.numeric(scale_h2))
+
+h2
+
+# Merge to TraitSel file
+
+traitsel <- read_excel("trait_selection/TraitSelection.xlsx", na=c("", NA))
+
+merged <- traitsel %>% 
+  full_join(h2, by = c("shorttraitname" = "trait"))
+write_xlsx(merged, "trait_selection/TraitSelection.xlsx")
+
+```
+
+
+## Forest plot
+
+Because of the large number of traits I think we should present a single row heatmap for each of the trait categories. 
+```{r category heatmap, eval = F}
+
+gatheredresults <- fread("results/ldsc/rg_results.tsv")
+
+
+gencor_forplot <- gatheredresults %>% 
+  filter(var1 == "MDD_PGC3" | var2 == "MDD_PGC3") %>% 
+  mutate(Trait = ifelse(var1 != "MDD_PGC3", var1, var2)) %>% 
+  group_by(Trait) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  filter(substr(Trait, 1, 3) != "MDD") %>% 
+  mutate(MDD = "MDD")
+
+fullnames <- read_excel("/Users/joepas/Library/CloudStorage/OneDrive-KarolinskaInstitutet/KI_MDD/MDD-MR/trait_selection/TraitSelection.xlsx", na=c("", NA)) %>% 
+  select(shorttraitname, `GWAS trait`, catcolor)
+
+h2_forplot <- h2 %>% 
+  mutate(h2 = ifelse(scale_h2 != liability_h2, liability_h2, scale_h2)) 
+
+numberoftraits <- gencor_forplot %>% 
+  ungroup() %>% 
+  summarise(n=n()) 
+
+numberoftraits <- as.numeric(numberoftraits)
+
+gencor_forplot <- gencor_forplot %>% 
+  left_join(fullnames, c("Trait" = "shorttraitname")) %>% 
+  arrange(Category) %>% 
+  group_by(Category) %>% 
+  mutate(`GWAS trait` = fct_reorder(`GWAS trait`, desc(abs(cor)))) %>% 
+  mutate(Pbin = ifelse(P < (0.05/numberoftraits), "*", "")) %>% 
+  left_join(h2_forplot, by = c("Trait" = "trait"))
+
+gencor_forplot1 <- gencor_forplot %>% 
+  head(n=61)
+
+gencor_forplot2 <- gencor_forplot %>% 
+  tail(n=54)
+
+#catcolors <- paletteer_d("ggthemes::Classic_20")
+catcolors <- gencor_forplot %>% 
+  group_by(Category) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  select(catcolor)
+catcolors <- catcolors$catcolor
+  
+plt1 <- ggplot(gencor_forplot1, aes(x=MDD, y=fct_rev(`GWAS trait`), fill=cor)) + 
+    geom_tile() +
+    scale_fill_gradient2(low = "grey35", mid = "white", high = "grey35") +
+    geom_text(data = gencor_forplot1, aes(label = round(cor, digits = 2)), color = "black", x = 0.8, size = 2)  +
+    geom_text(data = gencor_forplot1, aes(label = formatC(Pbin, format = "e", digits = 0)), x = 1, color = "darkred", size = 2)  +
+    geom_text(data = gencor_forplot1, aes(label = round(h2, digits = 2)), x = 1.2, color = "#0047AB", size = 2) +
+    theme_minimal(base_size = 8) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      panel.grid = element_blank(), 
+      legend.position = "none") +
+  labs(y = "", x = "") + 
+  ggforce::facet_col(facets = vars(Category), 
+                     scales = "free", 
+                     space = "free") +
+  theme(strip.text.y = element_text(angle = 0),
+        strip.background = element_rect(colour="white", fill="grey"),
+        strip.text = element_text(face = "bold"))
+
+
+# to color the strips by category
+plt1b <- ggplot_gtable(ggplot_build(plt1))
+stript <- which(grepl('strip-t', plt1b$layout$name))
+fills <- catcolors[1:6]
+
+k <- 1
+for (i in stript) {
+  j <- which(grepl('rect', plt1b$grobs[[i]]$grobs[[1]]$childrenOrder))
+  plt1b$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k <- k+1
+}
+
+
+
+
+
+
+plt2 <- ggplot(gencor_forplot2, aes(x=MDD, y=fct_rev(`GWAS trait`), fill=cor)) + 
+    geom_tile() +
+    scale_fill_gradient2(low = "grey35", mid = "white", high = "grey35") +
+    geom_text(data = gencor_forplot2, aes(label = round(cor, digits = 2)), x = 0.8, color = "black", size = 2)  +
+    geom_text(data = gencor_forplot2, aes(label = formatC(Pbin, format = "e", digits = 0)), x = 1, color = "darkred", size = 2)  +
+    geom_text(data = gencor_forplot2, aes(label = round(h2, digits = 2)), x = 1.2, color = "#0047AB", size = 2) +
+    theme_minimal(base_size = 8) +
+    theme(
+      axis.text.x = element_blank(),
+      axis.title.x = element_blank(),
+      panel.grid = element_blank(), 
+      legend.position = "none") +
+  labs(y = "", x = "") + 
+  ggforce::facet_col(facets = vars(Category), 
+                     scales = "free", 
+                     space = "free") +
+  theme(strip.text.y = element_text(angle = 0),
+        strip.background = element_rect(colour="white", fill="grey"),
+        strip.text = element_text(face = "bold"))
+
+# strips
+
+plt2b <- ggplot_gtable(ggplot_build(plt2))
+stript <- which(grepl('strip-t', plt2b$layout$name))
+fills <- catcolors[7:length(catcolors)]
+
+k <- 1
+for (i in stript) {
+  j <- which(grepl('rect', plt2b$grobs[[i]]$grobs[[1]]$childrenOrder))
+  plt2b$grobs[[i]]$grobs[[1]]$children[[j]]$gp$fill <- fills[k]
+  k <- k+1
+}
+
+
+plt <- grid.arrange(plt1b, plt2b, nrow = 1, ncol =2, widths = c(1.1, 1))
+ggsave("results/ldsc/gencor_cat.svg", plt, width = 6, height = 8)
+
+```
