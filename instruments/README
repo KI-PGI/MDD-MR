@@ -1,0 +1,1 @@
+These files can be read in with R (readRDS/ read.csv) and contain lists of all exposure data frames used for TSMR. exp_dat.rds contains instruments for all other traits to MDD, and MDD_exp_dat.tsv contains instruments from MDD to the other traits. 
